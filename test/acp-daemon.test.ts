@@ -14,7 +14,7 @@ import { afterEach, describe, expect, test } from "bun:test"
 import fs from "node:fs"
 import path from "node:path"
 import { tmpdir } from "node:os"
-import { sseText, hangFirstServer, until } from "./agent-cli-stub.ts"
+import { sseText, until } from "./agent-cli-stub.ts"
 import { stubServer } from "./sdk-stub.ts"
 
 /** Plain JSON, not sseText(): api-session.ts's sendOne calls the real
@@ -31,6 +31,30 @@ function okBody(text: string, model: string): Response {
     stop_reason: "end_turn", stop_sequence: null,
     usage: { input_tokens: 1, output_tokens: 1 },
   })
+}
+
+/** ApiSession-lane analogue of agent-cli-stub.ts's `hangFirstServer`: same
+ * "first request hangs forever, later ones answer" shape, but answering
+ * with `okBody` (plain JSON), not `sseText` (SSE) — the warm-session merge
+ * (api-sdk merge brief Task 2) repurposed agent-cli-stub.ts's own
+ * `hangFirstServer` back to its ORIGINAL SSE shape (it now backs
+ * WarmSession's real CLI-subprocess tests, which do need SSE), so a
+ * shared name serving two backends with two different wire shapes would be
+ * a landmine — this daemon's own ApiSession-backed tests get their own
+ * copy instead, local to this file, same as `okBody` already is. */
+function hangFirstServer(text: string, model: string): { url: string; stop: () => void; count: () => number } {
+  let n = 0
+  const s = Bun.serve({
+    port: 0,
+    fetch: async (req) => {
+      const body = await req.text()
+      if (!body) return new Response(null, { status: 200 })   // HEAD /api/hello probe
+      n++
+      if (n === 1) return new Promise<Response>(() => {})
+      return okBody(text, model)
+    },
+  })
+  return { url: `http://127.0.0.1:${s.port}`, stop: () => s.stop(true), count: () => n }
 }
 import {
   ACP_ERR_NO_CALL, ACP_ERR_CALL_CONSUMED, AUTH_RESOLVE_BUDGET_MS,
