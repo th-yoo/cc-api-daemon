@@ -297,6 +297,33 @@ describe("WarmSession (spawns bundled CLI, hermetic — fake ANTHROPIC_API_KEY, 
     expect(ws.turnInFlight()).toBe(false)
     cap.stop()
   }, CLI_TEST_TIMEOUT_MS)
+
+  test("warmHermeticEnv makes the spawned CLI present the fake key, never a bearer token — locks the credential-precedence claim this whole hermetic test file rests on", async () => {
+    // Load-bearing regression lock (Task 6): this file's own header claims
+    // the spawned CLI honors an explicit ANTHROPIC_API_KEY over on-disk/
+    // keychain credentials, verified empirically but never asserted
+    // anywhere. If a future CLI release ever flipped that precedence, every
+    // OTHER test here would still pass (the stub accepts any credential) —
+    // a real OAuth token would start flowing to this localhost stub with no
+    // alarm, since nothing reaches the real API either way. This is the one
+    // test that would catch it.
+    const cap = stubServer(() => sseText("ANSWER", STUB_DECLARED_MODEL))
+    const ws = new WarmSession(warmHermeticEnv(cap.url))
+    try {
+      const r = await ws.oneShot("ping", HAIKU, { recycle: false })
+      expect(r.kind).toBe("ok")
+      // HAZARD (brief, verbatim): assert on a BOOLEAN PROJECTION, never the
+      // captured header itself. bun:test prints the RECEIVED value on
+      // failure — if the precedence ever does flip, that received value is
+      // a REAL on-disk/keychain credential, and this repo's CI logs are
+      // public (CLAUDE.md "Credential safety"). `.toBeNull()` / asserting
+      // the raw string would make the regression test itself the leak. A
+      // failed boolean projection prints only `true`/`false`, never the
+      // secret that caused it.
+      expect(cap.captured[0]!.apiKey === "hermetic-test-key").toBe(true)
+      expect(cap.captured[0]!.authorization === null).toBe(true)
+    } finally { ws.close(); cap.stop() }
+  }, CLI_TEST_TIMEOUT_MS)
 })
 
 // WarmSession takes an `isolation` option, defaulting to GAUGE_ISOLATION.
