@@ -1,5 +1,5 @@
-// test/e2e.test.ts — client -> unix socket -> spawned daemon -> ApiSession
-// -> stub. Zero real API spend; the HTTP leg terminates at the local
+// test/e2e.test.ts — client -> WebSocket -> spawned daemon -> ApiSession ->
+// stub. Zero real API spend; the HTTP leg terminates at the local
 // Bun.serve stub (helpers.ts).
 //
 // CORRECTION on the plan's own Step 1 template (meta-harness commit
@@ -11,42 +11,37 @@
 // path.join(import.meta.dir, "acp-daemon.ts")` sibling resolution — this
 // exercises the actual production launch path, not a test-only entry point.
 //
-// Also corrected: the socket-dir env var. acp-paths.ts's socketPath() reads
-// `env.KKAMAK_ACP_SOCKET` as a full socket FILE path (not a directory) —
-// verified by reading the function, not guessed from the plan's
-// `KKAMAK_ACP_SOCKET_DIR` snippet, which doesn't exist in this codebase.
-// Each test gets its own short unique path (sock-path.ts's shortSock(),
-// same helper acp-client.test.ts/acp-daemon.test.ts already use — darwin
-// sun_path caps at 104B) so a spawned daemon can never outlive its test
-// into another one's socket.
-//
-// A THIRD reality-check beyond the plan's own two: ensureDaemon spawns in
-// the BACKGROUND unconditionally once it holds the spawn lock and no
-// daemon answers the first probe (acp-client.ts's ensureDaemon, step 2-3),
-// regardless of waitMs — a waitMs:200 call that returns false has still
-// kicked off a real subprocess that goes on to bind moments later. The
-// "no daemon listening" test therefore ALSO needs spawn-log tracking and
-// afterEach cleanup, not just the round-trip test; skipping that would leak
-// a live daemon per run, the exact hazard every sibling test file's own
-// header comment warns about ("NO TEST MAY EVER TOUCH
-// ~/.config/kkamak/acp-*.sock" — this is how a test would violate it).
+// websocket-transport swap (Task 5): each test now gets its own throwaway
+// HOME dir, not a unique unix socket path — discoveryPath (acp-paths.ts)
+// consults env.HOME explicitly, so a fresh mkdtemp'd HOME per test is what
+// isolates one test's daemon/discovery entry from another's, same mechanism
+// test/acp-daemon.test.ts and test/acp-client.test.ts already use. A
+// survivor daemon now holds a PORT, not a socket file, and a stale
+// discovery entry pointing at a dead port is the wedge shape afterEach
+// below has to avoid — same reasoning as the sibling files' own headers.
 import { afterEach, beforeEach, test, expect } from "bun:test"
 import fs from "node:fs"
+import path from "node:path"
+import { tmpdir } from "node:os"
 import { ensureDaemon, daemonCall, closeSession } from "../src/index.ts"
 import { ISO, stubEnv, respondWith, resetStub } from "./helpers.ts"
-import { shortSock } from "./sock-path.ts"
 
-const LIVE: Array<{ sock: string; spawnLog: string }> = []
+const LIVE: Array<{ home: string; spawnLog: string }> = []
 
 // Cheap insurance against the shared-stub state a prior test file/test left
 // behind (helpers.ts's server is process-wide) — the second test below
 // doesn't expect to reach the stub at all (its daemonCall should fail at
-// the socket-connect step), but if the background spawn from the first
-// test's cleanup race ever DID win, a stale "pong" responder would turn a
+// the connect step), but if the background spawn from the first test's
+// cleanup race ever DID win, a stale "pong" responder would turn a
 // should-be-no-call into a false "ok" instead of a clean failure.
 beforeEach(() => {
   resetStub()
 })
+
+function tempEndpoint(tag: string) {
+  const home = fs.mkdtempSync(path.join(tmpdir(), `e2e-${tag}-`))
+  return { home, spawnLog: path.join(home, "spawnlog") }
+}
 
 async function waitForSpawnLog(file: string, ms: number): Promise<void> {
   const deadline = Date.now() + ms
@@ -58,34 +53,31 @@ async function waitForSpawnLog(file: string, ms: number): Promise<void> {
   }
 }
 
-function killDaemonByPid(sock: string, spawnLog: string): void {
+function killDaemonByPid(home: string, spawnLog: string): void {
   try {
     for (const line of fs.readFileSync(spawnLog, "utf-8").split("\n")) {
       const pid = Number(line.trim().split(/\s+/)[0])
       if (Number.isInteger(pid) && pid > 0) { try { process.kill(pid, "SIGTERM") } catch { /* gone */ } }
     }
   } catch { /* never listened */ }
-  for (const p of [sock, `${sock}.spawn.lock`, `${sock}.bind.lock`, spawnLog]) {
-    try { fs.rmSync(p, { force: true }) } catch { /* ignore */ }
-  }
+  try { fs.rmSync(home, { recursive: true, force: true }) } catch { /* ignore */ }
 }
 
-// A daemon that survives the run wedges the next one on a stale socket —
-// killed here, never left to the process exiting. Best-effort wait for a
-// still-starting background spawn (see the header note above) before the
-// kill pass, so a slow-to-bind daemon isn't missed and left orphaned.
+// A daemon that survives the run wedges the next one on a stale discovery
+// entry — killed here, never left to the process exiting. Best-effort wait
+// for a still-starting background spawn (see the header note above) before
+// the kill pass, so a slow-to-bind daemon isn't missed and left orphaned.
 afterEach(async () => {
   while (LIVE.length) {
     const e = LIVE.pop()!
     await waitForSpawnLog(e.spawnLog, 3_000)
-    killDaemonByPid(e.sock, e.spawnLog)
+    killDaemonByPid(e.home, e.spawnLog)
   }
 })
 
-test("a turn round-trips client -> socket -> spawned daemon -> ApiSession -> stub", async () => {
-  const sock = shortSock("e2e-ok")
-  const spawnLog = `${sock}.spawnlog`
-  LIVE.push({ sock, spawnLog })
+test("a turn round-trips client -> WebSocket -> spawned daemon -> ApiSession -> stub", async () => {
+  const e = tempEndpoint("ok")
+  LIVE.push(e)
   // `Bun.spawn`'s `env` option REPLACES the child's environment entirely
   // (it does not merge with the current process's) — spawnDaemonProcess
   // (acp-client.ts) forwards exactly this object to the daemon subprocess.
@@ -96,13 +88,15 @@ test("a turn round-trips client -> socket -> spawned daemon -> ApiSession -> stu
   // ported daemon directly, since it binds fine standalone but never did
   // under this test until this fix). Spread real process.env FIRST for
   // PATH/HOME/etc., then stubEnv() OVER it so a real ANTHROPIC_API_KEY this
-  // dev machine might have set never wins over the fake one — zero real
-  // spend stays guaranteed regardless of host environment.
+  // dev machine might have set never wins over the fake one, and HOME LAST
+  // so this test's own throwaway dir always wins over whatever stubEnv()
+  // or process.env carry — zero real spend AND full discovery isolation
+  // stay guaranteed regardless of host environment.
   const env = {
     ...process.env,
     ...stubEnv(),
-    KKAMAK_ACP_SOCKET: sock,
-    KKAMAK_ACP_TEST_SPAWN_LOG: spawnLog,
+    HOME: e.home,
+    KKAMAK_ACP_TEST_SPAWN_LOG: e.spawnLog,
     KKAMAK_ACP_IDLE_MS: "8000",
   }
 
@@ -120,19 +114,18 @@ test("a turn round-trips client -> socket -> spawned daemon -> ApiSession -> stu
 }, 30_000)
 
 test("no daemon listening -> ensureDaemon false, daemonCall no-call", async () => {
-  const sock = shortSock("e2e-none")
-  const spawnLog = `${sock}.spawnlog`
+  const e = tempEndpoint("none")
   // Registered for cleanup even though this test expects `false`: ensureDaemon
   // spawns in the background regardless of waitMs (see header note) — a
   // short waitMs just means the probe gives up before the spawn finishes
   // binding, not that no spawn happened.
-  LIVE.push({ sock, spawnLog })
-  // process.env spread first, same PATH reasoning as the test above.
+  LIVE.push(e)
+  // process.env spread first, HOME last — same reasoning as the test above.
   const env = {
     ...process.env,
     ...stubEnv(),
-    KKAMAK_ACP_SOCKET: sock,
-    KKAMAK_ACP_TEST_SPAWN_LOG: spawnLog,
+    HOME: e.home,
+    KKAMAK_ACP_TEST_SPAWN_LOG: e.spawnLog,
     KKAMAK_ACP_IDLE_MS: "8000",
   }
   // waitMs: 0, not the plan's 200 — verified empirically: with the PATH fix
