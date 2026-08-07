@@ -16,6 +16,7 @@
 // expensive — see Task 5 Step 4a). index.ts now points at the real
 // acp-client.ts trio instead, so the twin is gone; sendOne — the only
 // thing that was ever genuinely new here — is what remains.
+import fs from "node:fs"
 import { buildClient } from "./client.ts"
 import type { AuthDeps } from "./auth.ts"
 import type { WarmIsolation } from "./acp-wire.ts"
@@ -23,6 +24,30 @@ import type { TurnOutcome } from "./session-contract.ts"
 
 const DEFAULT_BUDGET_MS = 60_000
 const DEFAULT_MAX_TOKENS = 2_048
+
+/** `.system` at cwd, gitignored, read fresh per call (no caching — matches
+ * this package's own no-caching bias elsewhere). Never throws: a missing
+ * or unreadable file is silently empty, same as an unset systemPrompt. */
+function readSystemFilePrefix(): string {
+  try {
+    return fs.readFileSync(".system", "utf-8")
+  } catch {
+    return ""
+  }
+}
+
+/** TEST SEAM, same shape as `authDeps`: `.system` is gitignored, so it can
+ * exist on a dev host without being repo state at all — a test suite that
+ * always reads the REAL file would have its outcome depend on whatever a
+ * given machine happens to have sitting in cwd (this was caught for real:
+ * a live `.system` at repo root broke two existing "no system key" /
+ * "systemPrompt verbatim" tests the moment this feature was added).
+ * Production omits this; the daemon always wants the real file. */
+export interface SystemFileDeps {
+  read: () => string
+}
+
+const realSystemFileDeps: SystemFileDeps = { read: readSystemFilePrefix }
 
 /** The ACP daemon's one-call leaf. No sessionId (the daemon owns session
  * identity via `DaemonState.sessions`); returns `TurnOutcome`; accepts an
@@ -42,6 +67,7 @@ export async function sendOne(
     authDeps?: AuthDeps
     signal?: AbortSignal
     messages?: Array<{ role: "user" | "assistant"; content: string }>
+    systemFileDeps?: SystemFileDeps
   },
 ): Promise<TurnOutcome> {
   const budgetMs = opts.budgetMs ?? DEFAULT_BUDGET_MS
@@ -55,13 +81,16 @@ export async function sendOne(
   if ("kind" in resolution) return { kind: "no-call" }
   const { client } = resolution
 
+  const systemFilePrefix = (opts.systemFileDeps ?? realSystemFileDeps).read()
+  const systemPrompt = [systemFilePrefix, opts.isolation.systemPrompt].filter(Boolean).join("\n")
+
   try {
     const response = await client.messages.create(
       {
         model,
         max_tokens: maxTokens,
         messages: opts.messages ?? [{ role: "user", content: outgoingText }],
-        ...(opts.isolation.systemPrompt ? { system: opts.isolation.systemPrompt } : {}),
+        ...(systemPrompt ? { system: systemPrompt } : {}),
       },
       { signal: opts.signal },
     )

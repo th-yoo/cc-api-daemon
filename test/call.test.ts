@@ -144,19 +144,67 @@ describe("ambient process.env poisoning", () => {
 
 // ── 6. system param ────────────────────────────────────────────────────────
 
+// NO_SYSTEM_FILE: every test in this describe block passes this explicitly
+// -- sendOne's default reads the REAL `.system` at cwd, and `.system` is
+// gitignored, meaning it can exist on a dev host without being repo state
+// at all. Caught for real: a live `.system` at this repo's own root broke
+// both "no system key" and "systemPrompt verbatim" the moment the
+// .system-prefix feature was added, since neither test controlled for it.
+const NO_SYSTEM_FILE = { read: () => "" }
+
 describe("system param", () => {
-  test("systemPrompt \"\" → request body has NO system key", async () => {
-    await sendOne("hi", ALIAS_MODEL, apiKeyEnv(), { isolation: ISO })
+  test("systemPrompt \"\" and no .system file → request body has NO system key", async () => {
+    await sendOne("hi", ALIAS_MODEL, apiKeyEnv(), { isolation: ISO, systemFileDeps: NO_SYSTEM_FILE })
     expect(getCaptured().length).toBe(1)
     expect("system" in getCaptured()[0]!.body).toBe(false)
   })
 
-  test("non-empty systemPrompt → body.system carries it verbatim", async () => {
+  test("non-empty systemPrompt, no .system file → body.system carries it verbatim", async () => {
     await sendOne("hi", ALIAS_MODEL, apiKeyEnv(), {
       isolation: { ...ISO, systemPrompt: "be terse" },
+      systemFileDeps: NO_SYSTEM_FILE,
     })
     expect(getCaptured().length).toBe(1)
     expect(getCaptured()[0]!.body.system).toBe("be terse")
+  })
+
+  test(".system file content alone (empty isolation.systemPrompt) → body.system is the file content", async () => {
+    await sendOne("hi", ALIAS_MODEL, apiKeyEnv(), {
+      isolation: ISO,
+      systemFileDeps: { read: () => "you are terse" },
+    })
+    expect(getCaptured()[0]!.body.system).toBe("you are terse")
+  })
+
+  test(".system file content is PREFIXED to isolation.systemPrompt, newline-joined", async () => {
+    await sendOne("hi", ALIAS_MODEL, apiKeyEnv(), {
+      isolation: { ...ISO, systemPrompt: "be terse" },
+      systemFileDeps: { read: () => "you are a pirate" },
+    })
+    expect(getCaptured()[0]!.body.system).toBe("you are a pirate\nbe terse")
+  })
+
+  test("a .system file that reads empty behaves exactly like no file at all", async () => {
+    await sendOne("hi", ALIAS_MODEL, apiKeyEnv(), {
+      isolation: { ...ISO, systemPrompt: "be terse" },
+      systemFileDeps: { read: () => "" },
+    })
+    expect(getCaptured()[0]!.body.system).toBe("be terse")
+  })
+
+  test("the DEFAULT systemFileDeps really does read the real .system file at cwd", async () => {
+    const fs = await import("node:fs")
+    const path = ".system"
+    const existed = fs.existsSync(path)
+    const saved = existed ? fs.readFileSync(path, "utf-8") : undefined
+    try {
+      fs.writeFileSync(path, "default-seam-marker")
+      await sendOne("hi", ALIAS_MODEL, apiKeyEnv(), { isolation: ISO })
+      expect(getCaptured()[0]!.body.system).toBe("default-seam-marker")
+    } finally {
+      if (existed) fs.writeFileSync(path, saved!)
+      else fs.rmSync(path, { force: true })
+    }
   })
 })
 
