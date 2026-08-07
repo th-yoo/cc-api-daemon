@@ -9,7 +9,7 @@ import { sendOne } from "./call.ts"
 import type { AuthDeps } from "./auth.ts"
 import { ACP_BUDGET, AUTH_RESOLVE_BUDGET_MS, type WarmIsolation } from "./acp-wire.ts"
 import type { WarmConstructOpts } from "./acp-pool.ts"
-import type { TurnOutcome } from "./session-contract.ts"
+import type { DispatchableSession, TurnOutcome, CancelResult } from "./session-contract.ts"
 
 interface PendingTurn {
   text: string
@@ -24,16 +24,7 @@ interface PendingTurn {
   settle: (o: TurnOutcome) => void
 }
 
-// Not `implements DispatchableSession` yet: the interface requires
-// oneShot AND cancel, and TS's `implements` check is all-or-nothing — a
-// class missing either one fails to compile, not just to satisfy the
-// contract at the missing methods. Task 4b lands `close`/`turnInFlight`
-// only, 4c adds `oneShot`, 4d adds `cancel`; the gate requires tsc clean at
-// every commit, so the `implements` clause moves to 4d, once every member
-// the interface requires actually exists. (The plan's own Step 3 template
-// declares `implements DispatchableSession` at this same partial point —
-// verified against reality: it does not compile.)
-export class ApiSession {
+export class ApiSession implements DispatchableSession {
   readonly isolation: WarmIsolation
   private readonly turnTimeoutMs: number
   private readonly queueWaitMs: number
@@ -146,5 +137,26 @@ export class ApiSession {
       this.draining = false
       this.current = undefined
     }
+  }
+
+  /** Never settles the turn as `ok`, and never settles it AT the moment of
+   * cancellation for an in-flight turn — the abort propagates and `drain`
+   * settles from the terminal outcome (upstream law L7). `unsent-dropped`
+   * is unreachable on this backend: a turn is either still queued (never
+   * dispatched) or already past the send boundary, with no window between
+   * dequeue and send. It stays in CancelResult for contract parity. */
+  cancel(tag: string): CancelResult {
+    if (this.current?.tag === tag) {
+      this.current.controller?.abort()
+      return "interrupted"
+    }
+    const queued = this.pending.find((t) => t.tag === tag)
+    if (queued) {
+      queued.dropped = true
+      this.pending = this.pending.filter((t) => t !== queued)
+      queued.settle({ kind: "no-call" })
+      return "queued-dropped"
+    }
+    return "unknown"
   }
 }

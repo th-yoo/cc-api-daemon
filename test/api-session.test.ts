@@ -185,3 +185,32 @@ describe("ApiSession — cross-client leak (singleton safety)", () => {
     expect((s as unknown as { history: unknown[] }).history).toEqual([])
   })
 })
+
+describe("ApiSession — cancel", () => {
+  test("cancelling a queued turn is queued-dropped and settles no-call", async () => {
+    const s = new ApiSession(stubEnv(), warmOpts())
+    respondWith({ delayMs: 200, content: [{ type: "text", text: "r" }], model: "claude-haiku-4-5" })
+    const first = s.oneShot("a", "claude-haiku-4-5", { recycle: true, tag: "t1" })
+    const second = s.oneShot("b", "claude-haiku-4-5", { recycle: false, tag: "t2" })
+    expect(s.cancel("t2")).toBe("queued-dropped")
+    expect((await second).kind).toBe("no-call")
+    await first
+    s.close()
+  })
+
+  test("cancelling the in-flight turn is interrupted and settles call-consumed", async () => {
+    const s = new ApiSession(stubEnv(), warmOpts())
+    respondWith({ delayMs: 5_000, content: [], model: "m" })
+    const p = s.oneShot("a", "claude-haiku-4-5", { recycle: true, tag: "t1" })
+    await Bun.sleep(20)
+    expect(s.cancel("t1")).toBe("interrupted")
+    expect((await p).kind).toBe("call-consumed")
+    s.close()
+  })
+
+  test("cancelling an unknown tag is unknown and disturbs nothing", async () => {
+    const s = new ApiSession(stubEnv(), warmOpts())
+    expect(s.cancel("nope")).toBe("unknown")
+    s.close()
+  })
+})
