@@ -440,6 +440,14 @@ describe("acp-client e2e (real daemon + stub)", () => {
     try {
       const env = {
         ...process.env,
+        // CI reality-check: on a dev host with real ambient credentials,
+        // auth.ts's resolveAuth silently succeeds off THAT ambient state
+        // even though ANTHROPIC_BASE_URL below redirects away from the
+        // real API -- masking that this test never injected its own
+        // credential. A credential-less host (CI) fails closed instead:
+        // no-call, not ok. Fixed key, spread AFTER process.env so it wins
+        // over whatever the host ambiently has.
+        ANTHROPIC_API_KEY: "k",
         ANTHROPIC_BASE_URL: cap.url,
         KKAMAK_ACP_SOCKET: sock,
         KKAMAK_ACP_TEST_SPAWN_LOG: spawnLog,
@@ -468,5 +476,45 @@ describe("acp-client e2e (real daemon + stub)", () => {
       return !fs.existsSync(sock)
     })()
     expect(gone).toBe(true)
+  }, 60_000)
+
+  // The invariant the CI failure above was really about: no test outcome
+  // here may depend on whether the HOST happens to carry real credentials.
+  // Deletes the other auth lane and redirects HOME so the linux
+  // credentials-file fallback cannot resolve even on a host that has one —
+  // the ONLY way this can reach `ok` is the ANTHROPIC_API_KEY injected
+  // below. If a future change re-introduces a spawnDaemon/env-construction
+  // site that forgets to inject its own credential, this is the test that
+  // would need it to be broken to catch it — proves the fix, not just
+  // documents it.
+  test("the round-trip succeeds even with every host credential scrubbed", async () => {
+    const sock = tempSock("scrubbed")
+    const spawnLog = `${sock}.spawnlog`
+    LIVE_DAEMONS.push({ sock, spawnLog })
+    const cap = stubServer(() => okResponse("ANSWER"))
+    const scrubbedHome = fs.mkdtempSync(path.join(tmpdir(), "cc-api-daemon-no-creds-"))
+    try {
+      const env: Record<string, string | undefined> = {
+        ...process.env,
+        ANTHROPIC_API_KEY: "k",
+        ANTHROPIC_BASE_URL: cap.url,
+        KKAMAK_ACP_SOCKET: sock,
+        KKAMAK_ACP_TEST_SPAWN_LOG: spawnLog,
+        KKAMAK_ACP_IDLE_MS: "8000",
+        HOME: scrubbedHome,
+      }
+      delete env.ANTHROPIC_AUTH_TOKEN
+      const started = await ensureDaemon(env, { waitMs: 15_000 })
+      expect(started).toBe(true)
+      const r = await daemonCall("hello", HAIKU, env, ISO)
+      expect(r.kind).toBe("ok")
+    } finally {
+      cap.stop()
+      fs.rmSync(scrubbedHome, { recursive: true, force: true })
+    }
+    for (const line of fs.readFileSync(spawnLog, "utf-8").split("\n")) {
+      const pid = Number(line.trim().split(/\s+/)[0])
+      if (Number.isInteger(pid) && pid > 0) { try { process.kill(pid, "SIGTERM") } catch { /* gone */ } }
+    }
   }, 60_000)
 })

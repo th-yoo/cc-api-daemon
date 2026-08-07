@@ -117,6 +117,19 @@ function tempEndpoint(tag: string) {
 function spawnDaemon(sock: string, spawnLog: string, extra: Record<string, string> = {}, idleMs = "8000") {
   const env: Record<string, string> = {
     ...(process.env as Record<string, string>),
+    // CI reality-check (Task 6 was never credential-FREE, only
+    // credential-DEPENDENT with the dependency hidden behind
+    // HAS_CLAUDE_CODE_CREDENTIALS -- dropping that gate exposed it instead
+    // of removing it). Every reenabled test below that reaches ApiSession's
+    // send boundary resolves auth from THIS spawned daemon's env
+    // (auth.ts's ANTHROPIC_API_KEY lane, checked first) -- on a dev host
+    // with real ambient credentials that ladder silently succeeds even
+    // though ANTHROPIC_BASE_URL is redirected to the local stub; on a
+    // credential-less host (a fresh CI runner) it fails closed, no-call.
+    // A fixed fake key here, spread BEFORE `...extra`, makes auth
+    // resolution deterministic regardless of host credential state --
+    // `...extra` still wins if a future test needs a different value.
+    ANTHROPIC_API_KEY: "k",
     KKAMAK_ACP_SOCKET: sock,
     KKAMAK_ACP_TEST_SPAWN_LOG: spawnLog,
     KKAMAK_ACP_IDLE_MS: idleMs,
