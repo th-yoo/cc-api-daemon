@@ -12,7 +12,6 @@
 //    re-implements it.
 import { afterEach, describe, expect, test } from "bun:test"
 import fs from "node:fs"
-import net from "node:net"
 import path from "node:path"
 import { tmpdir } from "node:os"
 import { sseText, hangFirstServer, until } from "./agent-cli-stub.ts"
@@ -34,12 +33,11 @@ function okBody(text: string, model: string): Response {
   })
 }
 import {
-  FrameDecoder, encodeFrame, ACP_ERR_NO_CALL, ACP_ERR_CALL_CONSUMED, AUTH_RESOLVE_BUDGET_MS,
+  ACP_ERR_NO_CALL, ACP_ERR_CALL_CONSUMED, AUTH_RESOLVE_BUDGET_MS,
   type WarmIsolation,
 } from "../src/acp-wire.ts"
-import { envFingerprint } from "../src/acp-paths.ts"
+import { envFingerprint, readDiscovery, writeDiscovery, wsUrl } from "../src/acp-paths.ts"
 import { createDaemonState, createDispatcher } from "../src/acp-daemon.ts"
-import { shortBase } from "./sock-path.ts"
 import { SessionPool, type WarmSessionLike, type WarmConstructOpts } from "../src/acp-pool.ts"
 import type { TurnOutcome, CancelResult } from "../src/session-contract.ts"
 
@@ -95,27 +93,39 @@ const HAIKU = "claude-haiku-4-5"
 const STUB_DECLARED_MODEL = "claude-haiku-4-5-20251001"
 const HAIKU_OBSERVED_KEY = HAIKU
 
-/** Every test builds its OWN socket/spawn-log pair under tmpdir. NO TEST MAY
- * EVER TOUCH ~/.config/kkamak/acp-*.sock — the afterEach below asserts it. */
+/** Every test builds its OWN throwaway HOME dir under tmpdir. Discovery
+ * files, both spawn/bind locks, and the daemon's spawn-log all live under
+ * it (acp-paths.ts's discoveryPath consults `env.HOME` explicitly, ahead
+ * of the real host's `os.homedir()`, for exactly this isolation seam) — so
+ * NO TEST EVER TOUCHES the real host's `~/.config/kkamak/`, without an
+ * afterEach hygiene assertion needing to check for it: killDaemon below
+ * just removes the whole throwaway HOME. */
 function tempEndpoint(tag: string) {
-  // Short base via sock-path.ts: darwin sun_path caps the socket path at 104B.
-  const base = shortBase(`d-${tag}`)
-  return { sock: `${base}.sock`, spawnLog: `${base}.spawnlog` }
+  const home = fs.mkdtempSync(path.join(tmpdir(), `d-${tag}-`))
+  return { home, spawnLog: path.join(home, "spawnlog") }
 }
 
 /** Spawn the REAL daemon as a detached child.
  *
  * `env` is passed EXPLICITLY and is the SAME object the caller fingerprints
  * (round-4 I2): the daemon computes envFingerprint(process.env) and
- * socketPath(process.env) from what it inherits, so a spawner that
- * fingerprints one env and launches with another gets a daemon on a
- * different path echoing a different fingerprint — mutual refusal forever.
+ * discoveryPath(process.env) from what it inherits, so a spawner that
+ * fingerprints one env and launches with another gets a daemon publishing a
+ * different discovery file echoing a different fingerprint — mutual
+ * refusal forever.
  *
  * KKAMAK_ACP_IDLE_MS is ALWAYS set to a few seconds here (round-4 M8): the
  * production default is 900 000 ms, and a test daemon that survives an
  * afterEach failure would sit on the host for fifteen minutes. */
-function spawnDaemon(sock: string, spawnLog: string, extra: Record<string, string> = {}, idleMs = "8000") {
-  const env: Record<string, string> = {
+/** Extracted so a test can compute the EXACT env a daemon will be spawned
+ * with BEFORE actually spawning it — needed to seed a stale discovery
+ * entry at the right fingerprint-derived path ahead of time (the
+ * stale-takeover test below), and to avoid the `readDiscovery({HOME:
+ * home})` bug this file's own history already caught once: a minimal
+ * {HOME} object and the real ~40-key spawned env compute DIFFERENT
+ * envFingerprints, hence different discovery paths. */
+function buildDaemonEnv(home: string, spawnLog: string, extra: Record<string, string> = {}, idleMs = "8000"): Record<string, string> {
+  return {
     ...(process.env as Record<string, string>),
     // CI reality-check (Task 6 was never credential-FREE, only
     // credential-DEPENDENT with the dependency hidden behind
@@ -130,11 +140,15 @@ function spawnDaemon(sock: string, spawnLog: string, extra: Record<string, strin
     // resolution deterministic regardless of host credential state --
     // `...extra` still wins if a future test needs a different value.
     ANTHROPIC_API_KEY: "k",
-    KKAMAK_ACP_SOCKET: sock,
+    HOME: home,
     KKAMAK_ACP_TEST_SPAWN_LOG: spawnLog,
     KKAMAK_ACP_IDLE_MS: idleMs,
     ...extra,
   }
+}
+
+function spawnDaemon(home: string, spawnLog: string, extra: Record<string, string> = {}, idleMs = "8000") {
+  const env = buildDaemonEnv(home, spawnLog, extra, idleMs)
   const daemon = path.join(import.meta.dir, "..", "src", "acp-daemon.ts")
   const quoted = ["bun", daemon].map((c) => `'${c.replace(/'/g, `'\\''`)}'`).join(" ")
   const proc = Bun.spawn(["bash", "-c", `nohup ${quoted} </dev/null >/dev/null 2>&1 &`], {
@@ -145,19 +159,18 @@ function spawnDaemon(sock: string, spawnLog: string, extra: Record<string, strin
 }
 
 /** Read the POST-LISTEN pids out of the spawn log and SIGTERM each one, then
- * unlink the socket and both locks. Pid-scoped, never `pkill -f` — §6e
- * forbids host-wide teardown (round-4 I9), and the Bun.spawn handle is the
- * `bash -c nohup` shell, not the daemon. */
-function killDaemon(sock: string, spawnLog: string): void {
+ * remove the whole throwaway HOME dir (discovery file, both locks, and the
+ * spawn log itself all live under it). Pid-scoped kill, never `pkill -f` —
+ * §6e forbids host-wide teardown (round-4 I9), and the Bun.spawn handle is
+ * the `bash -c nohup` shell, not the daemon. */
+function killDaemon(home: string, spawnLog: string): void {
   try {
     for (const line of fs.readFileSync(spawnLog, "utf-8").split("\n")) {
       const pid = Number(line.trim().split(/\s+/)[0])
       if (Number.isInteger(pid) && pid > 0) { try { process.kill(pid, "SIGTERM") } catch { /* gone */ } }
     }
   } catch { /* never listened */ }
-  for (const p of [sock, `${sock}.spawn.lock`, `${sock}.bind.lock`, spawnLog]) {
-    try { fs.rmSync(p, { force: true }) } catch { /* ignore */ }
-  }
+  try { fs.rmSync(home, { recursive: true, force: true }) } catch { /* ignore */ }
 }
 
 /** Poll the spawn log for at least `n` post-listen lines. */
@@ -173,107 +186,90 @@ async function waitForSpawnLog(spawnLog: string, n: number, ms: number): Promise
 
 interface JsonRpcReply { id?: number | string; result?: unknown; error?: { code: number; message: string; data?: { callConsumed: boolean; model?: string } } }
 
-/** Minimal NDJSON ACP client: net.connect + setEncoding + FrameDecoder,
- * matching the framing acp-wire.ts's tests already lock. Each connection
- * gets its OWN request-id counter starting at 1 — the real-world shape, and
- * the reason cancel-scoping must be tag-based (round-3 C2). */
-function connectNdjson(sock: string): Promise<{
+/** Minimal JSON-RPC-over-WebSocket ACP client. Each connection gets its OWN
+ * request-id counter starting at 1 — the real-world shape, and the reason
+ * cancel-scoping must be tag-based (round-3 C2).
+ *
+ * websocket-transport swap: replaces the old net.connect + FrameDecoder
+ * client. No `requestBatch` anymore — that existed ONLY to force two
+ * frames into ONE `socket.write()` so the daemon decoded+dispatched them
+ * in the SAME synchronous pass (the same-chunk-cancel trick both deleted
+ * cancel-race tests relied on, see this file's own note below). A
+ * WebSocket message IS its own frame; there is no "same chunk" to force
+ * two `.send()` calls into, so the concept has no home here — retired
+ * along with the tests that were its only callers. */
+function connectNdjson(env: Record<string, string | undefined>): Promise<{
   request: (method: string, params?: unknown) => Promise<any>
-  /** Writes every frame in ONE `socket.write()` call (2026-08-04 review
-   * finding, same-chunk-cancel fix). Two SEPARATE `request()`/`notify()`
-   * calls in the same synchronous JS tick still issue two SEPARATE socket
-   * writes -- the OS/loopback stack is NOT obligated to deliver them to
-   * the daemon's `data` handler as one chunk, so a caller relying on
-   * "fired back-to-back" for determinism (e.g. a cancel racing a prompt's
-   * send boundary) gets a race, not a guarantee -- measured flaky under
-   * load post-N3c-iii, once a session's own turn spawns its own CLI
-   * subprocess immediately instead of sitting behind a shared queue.
-   * Concatenating the encoded frames into a SINGLE write guarantees they
-   * land in the SAME `data` chunk, hence the SAME synchronous
-   * `decoder.push(chunk)` for-loop pass on the daemon side -- the daemon
-   * never yields to I/O between dispatching frame N and frame N+1 from one
-   * chunk, so ordering (and therefore "cancel sees the still-unsent turn")
-   * is deterministic, not timing-dependent. */
-  requestBatch: (frames: Array<{ method: string; params?: unknown }>) => Array<Promise<any>>
   notify: (method: string, params?: unknown) => void
   onNotification: (method: string, cb: (params: any) => void) => void
   close: () => void
 }> {
   return new Promise((resolve, reject) => {
-    const socket = net.connect(sock)
-    socket.setEncoding("utf8")
-    const decoder = new FrameDecoder()
+    // Bug fixed while chasing a "no discovery file" false-negative: this
+    // MUST be readDiscovery(env) with the SAME env spawnDaemon actually
+    // spawned the daemon with, not a minimal {HOME: home} stand-in.
+    // envFingerprint hashes the WHOLE env (minus the denylist), so a
+    // 1-key object and the real ~40-key spawned env compute DIFFERENT
+    // fingerprints and therefore DIFFERENT discovery paths -- connectNdjson
+    // would reliably look in the wrong place. Verified the two fingerprints
+    // actually differ before concluding this, not assumed.
+    const discovery = readDiscovery(env)
+    if (!discovery) {
+      reject(new Error(`connectNdjson: no discovery file for this env — call waitForSpawnLog first`))
+      return
+    }
+    const ws = new WebSocket(wsUrl(discovery.port))
     let nextId = 1
     const pending = new Map<number, { resolve: (v: any) => void; reject: (e: any) => void }>()
     const notifHandlers = new Map<string, (p: any) => void>()
 
-    socket.once("connect", () => {
-      socket.removeListener("error", reject)
-      socket.on("error", () => { /* connection torn down mid-test: never crash the test process */ })
+    ws.onopen = () => {
       resolve({
         request(method: string, params?: unknown) {
           const id = nextId++
           return new Promise((res, rej) => {
             pending.set(id, { resolve: res, reject: rej })
-            socket.write(encodeFrame({ jsonrpc: "2.0", id, method, params }))
+            ws.send(JSON.stringify({ jsonrpc: "2.0", id, method, params }))
           })
-        },
-        requestBatch(frames: Array<{ method: string; params?: unknown }>) {
-          let payload = ""
-          const promises = frames.map(({ method, params }) => {
-            const id = nextId++
-            const p = new Promise((res, rej) => { pending.set(id, { resolve: res, reject: rej }) })
-            payload += encodeFrame({ jsonrpc: "2.0", id, method, params })
-            return p
-          })
-          socket.write(payload)   // ONE write -- see the method's own doc comment above
-          return promises
         },
         notify(method: string, params?: unknown) {
-          socket.write(encodeFrame({ jsonrpc: "2.0", method, params }))
+          ws.send(JSON.stringify({ jsonrpc: "2.0", method, params }))
         },
         onNotification(method: string, cb: (params: any) => void) { notifHandlers.set(method, cb) },
-        close() { socket.destroy() },
+        close() { ws.close() },
       })
-    })
-    socket.on("data", (chunk) => {
-      for (const f of decoder.push(chunk)) {
-        const msg = f as JsonRpcReply & { method?: string; params?: unknown }
-        if (msg.id === undefined && typeof msg.method === "string") {
-          const h = notifHandlers.get(msg.method)
-          if (h) h(msg.params)
-          continue
-        }
-        if (typeof msg.id === "number" && pending.has(msg.id)) {
-          const p = pending.get(msg.id)!
-          pending.delete(msg.id)
-          if (msg.error) p.reject(Object.assign(new Error(msg.error.message), { code: msg.error.code, data: msg.error.data }))
-          else p.resolve(msg.result)
-        }
+    }
+    ws.onmessage = (ev) => {
+      let msg: (JsonRpcReply & { method?: string; params?: unknown }) | undefined
+      try { msg = JSON.parse(String(ev.data)) } catch { return }
+      if (!msg) return
+      if (msg.id === undefined && typeof msg.method === "string") {
+        const h = notifHandlers.get(msg.method)
+        if (h) h(msg.params)
+        return
       }
-    })
-    socket.once("error", reject)
+      if (typeof msg.id === "number" && pending.has(msg.id)) {
+        const p = pending.get(msg.id)!
+        pending.delete(msg.id)
+        if (msg.error) p.reject(Object.assign(new Error(msg.error.message), { code: msg.error.code, data: msg.error.data }))
+        else p.resolve(msg.result)
+      }
+    }
+    ws.onerror = () => reject(new Error("connectNdjson: WebSocket error"))
   })
 }
 
-const LIVE: Array<{ sock: string; spawnLog: string }> = []
+const LIVE: Array<{ home: string; spawnLog: string }> = []
 
-const acpDir = () => path.join(process.env.HOME ?? "", ".config", "kkamak")
-const acpSocksNow = (): string[] =>
-  fs.existsSync(acpDir()) ? fs.readdirSync(acpDir()).filter((f) => f.startsWith("acp-")) : []
-const PRE_EXISTING = new Set(acpSocksNow())
-const newAcpSocks = (): string[] => acpSocksNow().filter((f) => !PRE_EXISTING.has(f))
-
+// websocket-transport swap: the old hygiene assertion here diffed
+// `~/.config/kkamak` against what was already listening on the REAL host,
+// because the socket path had nowhere else to live. Discovery files now
+// live under each test's own throwaway HOME (tempEndpoint), so there is no
+// shared real-host directory to diff — a leaked daemon is caught the same
+// way any other test-scoped resource leak is (its temp HOME dir simply
+// stays behind), not by a bespoke directory-delta check.
 afterEach(() => {
-  while (LIVE.length) { const e = LIVE.pop()!; killDaemon(e.sock, e.spawnLog) }
-  // The hygiene invariant, asserted rather than hoped for — as a DELTA
-  // against what was already listening, not absolute emptiness.
-  // `~/.config/kkamak` is shared with the live host, and since the
-  // review-sensor was armed (2026-08-06, ledger ts 1785996709580) it drives
-  // the ACP warm lane, so a real `acp-<fp>.sock` is routinely present while
-  // tests run. Absolute emptiness fails every test here on an armed host and
-  // wedges the gate that runs them. A genuine leak is still a NEW file.
-  expect(newAcpSocks()).toEqual([])
+  while (LIVE.length) { const e = LIVE.pop()!; killDaemon(e.home, e.spawnLog) }
 })
 
 // ── wire-level behaviour: no model is ever reached, so NO credentials
@@ -285,9 +281,9 @@ describe("acp-daemon wire behaviour (no model reached)", () => {
     const e = tempEndpoint("nocall"); LIVE.push(e)
     const cap = stubServer(() => sseText("SHOULD-NEVER-BE-CALLED"))
     try {
-      spawnDaemon(e.sock, e.spawnLog, { ANTHROPIC_BASE_URL: cap.url })
+      const { env } = spawnDaemon(e.home, e.spawnLog, { ANTHROPIC_BASE_URL: cap.url })
       await waitForSpawnLog(e.spawnLog, 1, 15_000)
-      const c = await connectNdjson(e.sock)
+      const c = await connectNdjson(env)
       await c.request("initialize", { protocolVersion: 1 })
       const s = await c.request("session/new", { cwd: process.cwd(), mcpServers: [], _meta: { kkamak: { isolation: TEST_ISOLATION } } })
       await expect(c.request("session/prompt", {
@@ -302,9 +298,9 @@ describe("acp-daemon wire behaviour (no model reached)", () => {
 
   test("N3c-iii test 5: session/new without isolation -> -32602, and no session is recorded", async () => {
     const e = tempEndpoint("newnoiso"); LIVE.push(e)
-    spawnDaemon(e.sock, e.spawnLog)
+    const { env } = spawnDaemon(e.home, e.spawnLog)
     await waitForSpawnLog(e.spawnLog, 1, 15_000)
-    const c = await connectNdjson(e.sock)
+    const c = await connectNdjson(env)
     await c.request("initialize", { protocolVersion: 1 })
     await expect(c.request("session/new", { cwd: process.cwd(), mcpServers: [] })) // no _meta at all
       .rejects.toMatchObject({ code: -32602 })
@@ -317,9 +313,9 @@ describe("acp-daemon wire behaviour (no model reached)", () => {
     const e = tempEndpoint("unknownsession"); LIVE.push(e)
     const cap = stubServer(() => sseText("SHOULD-NEVER-BE-CALLED"))
     try {
-      spawnDaemon(e.sock, e.spawnLog, { ANTHROPIC_BASE_URL: cap.url })
+      const { env } = spawnDaemon(e.home, e.spawnLog, { ANTHROPIC_BASE_URL: cap.url })
       await waitForSpawnLog(e.spawnLog, 1, 15_000)
-      const c = await connectNdjson(e.sock)
+      const c = await connectNdjson(env)
       await c.request("initialize", { protocolVersion: 1 })
       // No session/new was ever called for this id -- a fabricated
       // sessionId must never reach the pool, let alone bill a turn (the
@@ -337,180 +333,130 @@ describe("acp-daemon wire behaviour (no model reached)", () => {
 
   test("unknown method -> -32601 and the connection survives", async () => {
     const e = tempEndpoint("unknown"); LIVE.push(e)
-    spawnDaemon(e.sock, e.spawnLog)
+    const { env } = spawnDaemon(e.home, e.spawnLog)
     await waitForSpawnLog(e.spawnLog, 1, 15_000)
-    const c = await connectNdjson(e.sock)
+    const c = await connectNdjson(env)
     await expect(c.request("totally/bogus", {})).rejects.toMatchObject({ code: -32601 })
     const init = await c.request("initialize", { protocolVersion: 1 })
     expect(init.protocolVersion).toBe(1)
     c.close()
   }, DAEMON_TEST_TIMEOUT_MS)
 
-  test("a malformed frame does not kill the daemon", async () => {
+  // websocket-transport swap: a "malformed frame" over a raw unix socket
+  // (arbitrary bytes with no message boundary) has no direct analog over
+  // WebSocket, where every `.send()` call IS a discrete message — so this
+  // now exercises jsonrpc.ts's Parse Error path instead: a WS text message
+  // that fails JSON.parse. That path replies with -32700 (unlike a
+  // structurally-invalid-but-parseable request, which may or may not get a
+  // reply depending on whether it's a notification) — worth asserting the
+  // reply shape here, not just "connection survives".
+  test("a malformed (non-JSON) WebSocket message gets a Parse Error reply and the connection survives", async () => {
     const e = tempEndpoint("malformed"); LIVE.push(e)
-    spawnDaemon(e.sock, e.spawnLog)
+    const { env } = spawnDaemon(e.home, e.spawnLog)
     await waitForSpawnLog(e.spawnLog, 1, 15_000)
-    const socket = net.connect(e.sock)
-    await new Promise<void>((res, rej) => { socket.once("connect", () => res()); socket.once("error", rej) })
-    socket.setEncoding("utf8")
-    socket.write("garbage-not-json\n")
-    // give the daemon a moment to (not) choke on it, then prove it is alive.
-    await new Promise((r) => setTimeout(r, 200))
-    socket.destroy()
-    const c = await connectNdjson(e.sock)
+    const discovery = readDiscovery(env)
+    if (!discovery) throw new Error("no discovery file after spawn")
+    const ws = new WebSocket(wsUrl(discovery.port))
+    await new Promise<void>((res, rej) => { ws.onopen = () => res(); ws.onerror = () => rej(new Error("ws error")) })
+    const parseError = new Promise<any>((resolve) => {
+      ws.onmessage = (ev) => resolve(JSON.parse(String(ev.data)))
+    })
+    ws.send("garbage-not-json")
+    const reply = await parseError
+    expect(reply).toMatchObject({ jsonrpc: "2.0", id: null, error: { code: -32700 } })
+    ws.close()
+    // Prove the CONNECTION (and the daemon) survived the malformed message,
+    // not just that this one reply arrived.
+    const c = await connectNdjson(env)
     const init = await c.request("initialize", { protocolVersion: 1 })
     expect(init.protocolVersion).toBe(1)
     c.close()
   }, DAEMON_TEST_TIMEOUT_MS)
 
-  // FINDING (Task 6), not a re-skip: dropping Task 1's `.skip` and running
-  // this for real (ApiSession's oneShot/drain now exist) still fails —
-  // `bPromise`/`promptPromise` reject ACP_ERR_CALL_CONSUMED, not the
-  // expected ACP_ERR_NO_CALL. Root cause traced, not guessed: this test's
-  // premise is that writing session/prompt + session/cancel in ONE socket
-  // write lets the daemon decode+dispatch both in the SAME synchronous
-  // `for (const f of decoder.push(chunk))` pass, so the cancel is processed
-  // before the prompt's first real await — exactly how it worked upstream,
-  // where WarmSession's first await was a dynamic `import()` sitting BEFORE
-  // the send boundary. ApiSession.drain has no such yield point: from
-  // dequeuing the turn (`this.pending.shift()`) through `turn.sent = true`
-  // through calling `sendOne(...)`, every step is synchronous — the first
-  // real await is buried inside sendOne's own `client.messages.create(...)`
-  // call, one level too deep to give the cancel frame's turn in the decode
-  // loop a chance to run first. So a cancel arriving in the same chunk as
-  // its target prompt can never preempt that prompt's send on this backend,
-  // structurally, regardless of timing tuning. Fixing this is a design
-  // change to ApiSession.oneShot/drain (adding a real yield point before
-  // the send boundary) — out of Task 6's scope (proving the wiring +
-  // paying down Task 1's skip debt), and risks changing FIFO/queueWaitMs
-  // semantics that 4c/4d's own passing tests already pin. test.todo (not
-  // .skip): the body below doesn't run, so it can't dangle a promise into
-  // the next test (see the SCOPED-cancel test's own note), and it doesn't
-  // match Step 4b's `grep "\.skip\|skipIf"` — an honest "known, understood,
-  // unfixed" marker, not a hidden failure.
-  test.todo("session/cancel sent as a NOTIFICATION (no id) is honoured and NOT answered", async () => {
-    const e = tempEndpoint("cancelnotif"); LIVE.push(e)
-    const cap = stubServer(() => sseText("ANSWER", STUB_DECLARED_MODEL))
-    try {
-      spawnDaemon(e.sock, e.spawnLog, { ANTHROPIC_BASE_URL: cap.url })
-      await waitForSpawnLog(e.spawnLog, 1, 15_000)
-
-      // Round-2 review finding 2 (2026-08-05): the ORIGINAL version of this
-      // test used `connectNdjson`, whose dispatch silently discards any
-      // frame matching neither its "has a numeric id" (response) nor "has
-      // no id AND a registered method handler" (notification) paths -- so
-      // `sawUnexpectedFrame` above was declared, never assigned, and the
-      // `expect` was a tautology that could not fail no matter what the
-      // daemon did. This version watches the RAW decoded frame stream
-      // directly. The one shape that must never appear is a frame with
-      // NEITHER `id` NOR `method`: that is exactly what "answering a
-      // notification" would produce on the wire (JSON.stringify drops an
-      // `id: undefined` key entirely, and a response has no `method`) --
-      // it is not a legal frame under any other circumstance (every
-      // legitimate response carries an id, every legitimate notification
-      // carries a method).
-      const socket = net.connect(e.sock)
-      await new Promise<void>((res, rej) => { socket.once("connect", () => res()); socket.once("error", rej) })
-      socket.setEncoding("utf8")
-      const decoder = new FrameDecoder()
-      let nextId = 1
-      const pending = new Map<number, { resolve: (v: any) => void; reject: (e: any) => void }>()
-      let illegalFrame: unknown
-
-      socket.on("data", (chunk) => {
-        for (const f of decoder.push(chunk)) {
-          const msg = f as { id?: unknown; method?: unknown; result?: unknown; error?: { code: number; message: string; data?: unknown } }
-          if (msg.id === undefined && msg.method === undefined) illegalFrame = f
-          if (typeof msg.id === "number" && pending.has(msg.id)) {
-            const p = pending.get(msg.id)!
-            pending.delete(msg.id)
-            if (msg.error) p.reject(Object.assign(new Error(msg.error.message), { code: msg.error.code, data: msg.error.data }))
-            else p.resolve(msg.result)
-          }
-        }
-      })
-      const request = (method: string, params?: unknown): Promise<any> => {
-        const id = nextId++
-        return new Promise((resolve, reject) => {
-          pending.set(id, { resolve, reject })
-          socket.write(encodeFrame({ jsonrpc: "2.0", id, method, params }))
-        })
-      }
-      await request("initialize", { protocolVersion: 1 })
-      const s = await request("session/new", { cwd: process.cwd(), mcpServers: [], _meta: { kkamak: { isolation: TEST_ISOLATION } } })
-
-      // 2026-08-04 review finding (same class as the "SAME JSON-RPC id"
-      // cancel-scoping test below): `request()` then `notify()` as two
-      // SEPARATE `socket.write()` calls is not a same-chunk guarantee, and
-      // post-N3c-iii this session's turn spawns its OWN CLI subprocess
-      // immediately (no shared-warm-session queue to hide behind) -- a
-      // split delivery can let the cancel notification land AFTER the send
-      // boundary crosses, flipping this test's expected ACP_ERR_NO_CALL to
-      // ACP_ERR_CALL_CONSUMED nondeterministically. Write BOTH frames in
-      // ONE `socket.write()` so the daemon decodes and dispatches them in
-      // the SAME synchronous for-loop pass -- the cancel is then
-      // guaranteed to run before the turn ever reaches its first real
-      // await (the SDK's dynamic import), long before it sends.
-      const promptId = nextId++
-      const promptPromise = new Promise<any>((resolve, reject) => {
-        pending.set(promptId, { resolve, reject })
-      })
-      const promptFrame = encodeFrame({
-        jsonrpc: "2.0", id: promptId, method: "session/prompt",
-        params: { sessionId: s.sessionId, prompt: [{ type: "text", text: "cancel me" }], _meta: { kkamak: { model: HAIKU } } },
-      })
-      const cancelFrame = encodeFrame({ jsonrpc: "2.0", method: "session/cancel", params: { sessionId: s.sessionId } })
-      socket.write(promptFrame + cancelFrame)
-
-      await expect(promptPromise).rejects.toMatchObject({ code: ACP_ERR_NO_CALL, data: { callConsumed: false } })
-      // Give a buggy "answer the notification" frame a moment to arrive.
-      await new Promise((r) => setTimeout(r, 200))
-      expect(illegalFrame).toBeUndefined()
-      socket.destroy()
-    } finally { cap.stop() }
-  }, DAEMON_TEST_TIMEOUT_MS)
+  // RETIRED, not fixed and not re-skipped (websocket-transport plan, Task
+  // 3 Step 2): this test's premise — a session/prompt and a session/cancel
+  // written in ONE socket write, decoded and dispatched by the daemon in
+  // ONE synchronous pass, so the cancel could reach ApiSession before the
+  // prompt's send boundary — is UNCONSTRUCTIBLE over WebSocket. Each
+  // `ws.send()` call is its own discrete message; the daemon's `message`
+  // handler runs once per message, so two sends are unconditionally TWO
+  // separate event-loop turns, never one. There is no "same chunk" left to
+  // force. The underlying structural finding this test surfaced (traced
+  // during the unix-socket CI-fix work: ApiSession.drain has no await
+  // between dequeuing a turn and the send boundary, so a same-chunk cancel
+  // could never preempt the send) is unaffected by the transport and still
+  // true — it's just that this specific test can no longer express the
+  // premise it needs to exercise it. See the SCOPED-cancel test's own note
+  // below for the second, identical case.
 
   test("idle reaper drains, exits, and removes the socket", async () => {
     const e = tempEndpoint("idle"); LIVE.push(e)
-    spawnDaemon(e.sock, e.spawnLog, {}, "1500")
+    const { env } = spawnDaemon(e.home, e.spawnLog, {}, "1500")
     await waitForSpawnLog(e.spawnLog, 1, 15_000)
     const lines = await waitForSpawnLog(e.spawnLog, 1, 15_000)
     const pid = Number(lines[0]?.trim().split(/\s+/)[0])
-    const c = await connectNdjson(e.sock)
+    const c = await connectNdjson(env)
     await c.request("initialize", { protocolVersion: 1 })
     c.close()
     // reaper ticks at min(60s, idleMs/3) = 500ms here; give it comfortable
     // margin over the 1500ms idle budget.
     const gone = await until(() => { try { process.kill(pid, 0); return false } catch { return true } }, 8_000)
     expect(gone).toBe(true)
-    expect(fs.existsSync(e.sock)).toBe(false)
+    // websocket-transport swap: "removes the socket" becomes "removes the
+    // discovery file" — e.home ITSELF still exists (this test's own
+    // mkdtemp'd dir, never removed by the daemon); what the daemon's
+    // shutdown deletes is the discovery entry underneath it.
+    expect(readDiscovery(env)).toBeUndefined()
   }, DAEMON_TEST_TIMEOUT_MS)
 
-  test("stale socket file is taken over under the BIND lock", async () => {
+  // websocket-transport swap: "a dead FILE at the socket path" has no
+  // direct analog — a discovery file's payload is a port number, and
+  // staleness is "does the daemon connect-probe that port and get nothing
+  // back", not "is there a stray file". Simulated here by binding a
+  // throwaway server on port 0, closing it immediately (freeing the port
+  // with very high probability — the OS does not typically hand out the
+  // same ephemeral port again within this test's own short window), then
+  // writing a discovery file that CLAIMS a daemon is listening there. The
+  // real daemon's own bindWithTakeover must probe that port, get no
+  // WebSocket handshake back, and take over — publishing its OWN real
+  // port to the SAME discovery path, which is exactly what connectNdjson
+  // reads after waitForSpawnLog confirms the takeover succeeded.
+  test("a stale discovery file (pointing at a dead port) is taken over under the BIND lock", async () => {
     const e = tempEndpoint("stale"); LIVE.push(e)
-    fs.mkdirSync(path.dirname(e.sock), { recursive: true })
-    fs.writeFileSync(e.sock, "")   // a dead file, not a live listener
-    spawnDaemon(e.sock, e.spawnLog)
+    const throwaway = Bun.serve({ port: 0, fetch: () => new Response() })
+    const deadPort = throwaway.port
+    if (deadPort === undefined) throw new Error("Bun.serve({port:0}) did not assign a port")
+    throwaway.stop(true)
+    // Compute the EXACT env the daemon will be spawned with, BEFORE
+    // spawning it, so the stale entry is seeded at the SAME
+    // fingerprint-derived discovery path the real daemon will probe and
+    // take over.
+    const env = buildDaemonEnv(e.home, e.spawnLog)
+    writeDiscovery(env, { port: deadPort, pid: 999_999 })
+    spawnDaemon(e.home, e.spawnLog)
     await waitForSpawnLog(e.spawnLog, 1, 15_000)
-    const c = await connectNdjson(e.sock)
+    const c = await connectNdjson(env)
     const init = await c.request("initialize", { protocolVersion: 1 })
     expect(init.protocolVersion).toBe(1)
+    // The takeover REPLACED the stale entry with a real one — not the
+    // dead port this test seeded.
+    expect(readDiscovery(env)?.port).not.toBe(deadPort)
     c.close()
   }, DAEMON_TEST_TIMEOUT_MS)
 
-  test("a LIVE socket is not taken over: the second starter exits 0, writes NO spawn-log line, and the first still answers", async () => {
+  test("a LIVE daemon is not taken over: the second starter exits 0, writes NO spawn-log line, and the first still answers", async () => {
     const e = tempEndpoint("live"); LIVE.push(e)
-    spawnDaemon(e.sock, e.spawnLog)
+    const { env } = spawnDaemon(e.home, e.spawnLog)
     const first = await waitForSpawnLog(e.spawnLog, 1, 15_000)
     expect(first.length).toBe(1)
     // Second starter, same socket/spawn-log pair: must see the first as
     // live and refuse to bind, writing nothing.
-    spawnDaemon(e.sock, e.spawnLog)
+    spawnDaemon(e.home, e.spawnLog)
     // Settle time for the second starter to probe and exit.
     await new Promise((r) => setTimeout(r, 2_000))
     const lines = fs.readFileSync(e.spawnLog, "utf-8").split("\n").filter((l) => l.trim())
     expect(lines.length).toBe(1)
-    const c = await connectNdjson(e.sock)
+    const c = await connectNdjson(env)
     const init = await c.request("initialize", { protocolVersion: 1 })
     expect(init.protocolVersion).toBe(1)
     c.close()
@@ -518,9 +464,9 @@ describe("acp-daemon wire behaviour (no model reached)", () => {
 
   test("ROUND-4 I2: the daemon binds and echoes from the env it was GIVEN, not from an ambient one", async () => {
     const e = tempEndpoint("envcontract"); LIVE.push(e)
-    const { env } = spawnDaemon(e.sock, e.spawnLog, { ANTHROPIC_MODEL: "probe-value" })
+    const { env } = spawnDaemon(e.home, e.spawnLog, { ANTHROPIC_MODEL: "probe-value" })
     await waitForSpawnLog(e.spawnLog, 1, 15_000)
-    const c = await connectNdjson(e.sock)
+    const c = await connectNdjson(env)
     const init = await c.request("initialize", { protocolVersion: 1 })
     expect(init._meta.kkamak.envFingerprint).toBe(envFingerprint(env))
     c.close()
@@ -955,9 +901,9 @@ describe("acp-daemon over unix socket (reaches the stubbed model)", () => {
     const e = tempEndpoint("rt"); LIVE.push(e)
     const cap = stubServer(() => okBody("ANSWER", STUB_DECLARED_MODEL))
     try {
-      const { env } = spawnDaemon(e.sock, e.spawnLog, { ANTHROPIC_BASE_URL: cap.url })
+      const { env } = spawnDaemon(e.home, e.spawnLog, { ANTHROPIC_BASE_URL: cap.url })
       await waitForSpawnLog(e.spawnLog, 1, 15_000)
-      const c = await connectNdjson(e.sock)
+      const c = await connectNdjson(env)
       const init = await c.request("initialize", { protocolVersion: 1 })
       expect(init.protocolVersion).toBe(1)
       expect(init._meta.kkamak.envFingerprint).toBe(envFingerprint(env))
@@ -994,9 +940,9 @@ describe("acp-daemon over unix socket (reaches the stubbed model)", () => {
     const CAPTURED: Array<Record<string, unknown>> = []
     const cap = stubServer((c) => { CAPTURED.push(c.body); return okBody("ANSWER", STUB_DECLARED_MODEL) })
     try {
-      spawnDaemon(e.sock, e.spawnLog, { ANTHROPIC_BASE_URL: cap.url })
+      const { env } = spawnDaemon(e.home, e.spawnLog, { ANTHROPIC_BASE_URL: cap.url })
       await waitForSpawnLog(e.spawnLog, 1, 15_000)
-      const c = await connectNdjson(e.sock)
+      const c = await connectNdjson(env)
       await c.request("initialize", { protocolVersion: 1 })
 
       const sGauge = await c.request("session/new", {
@@ -1031,9 +977,9 @@ describe("acp-daemon over unix socket (reaches the stubbed model)", () => {
     const CAPTURED: Array<Record<string, unknown>> = []
     const cap = stubServer((c) => { CAPTURED.push(c.body); return okBody("ANSWER", STUB_DECLARED_MODEL) })
     try {
-      spawnDaemon(e.sock, e.spawnLog, { ANTHROPIC_BASE_URL: cap.url })
+      const { env } = spawnDaemon(e.home, e.spawnLog, { ANTHROPIC_BASE_URL: cap.url })
       await waitForSpawnLog(e.spawnLog, 1, 15_000)
-      const c = await connectNdjson(e.sock)
+      const c = await connectNdjson(env)
       await c.request("initialize", { protocolVersion: 1 })
 
       const s1 = await c.request("session/new", { cwd: process.cwd(), mcpServers: [], _meta: { kkamak: { isolation: TEST_ISOLATION } } })
@@ -1070,10 +1016,10 @@ describe("acp-daemon over unix socket (reaches the stubbed model)", () => {
     const CAPTURED: Array<Record<string, unknown>> = []
     const cap = stubServer((c) => { CAPTURED.push(c.body); return okBody("ANSWER", STUB_DECLARED_MODEL) })
     try {
-      spawnDaemon(e.sock, e.spawnLog, { ANTHROPIC_BASE_URL: cap.url })
+      const { env } = spawnDaemon(e.home, e.spawnLog, { ANTHROPIC_BASE_URL: cap.url })
       await waitForSpawnLog(e.spawnLog, 1, 15_000)
-      const cA = await connectNdjson(e.sock)
-      const cB = await connectNdjson(e.sock)
+      const cA = await connectNdjson(env)
+      const cB = await connectNdjson(env)
       await cA.request("initialize", { protocolVersion: 1 })
       await cB.request("initialize", { protocolVersion: 1 })
       const sA = await cA.request("session/new", { cwd: process.cwd(), mcpServers: [], _meta: { kkamak: { isolation: TEST_ISOLATION } } })
@@ -1133,9 +1079,9 @@ describe("acp-daemon over unix socket (reaches the stubbed model)", () => {
     let n = 0
     const cap = stubServer(() => (++n === 1 ? new Response("boom", { status: 500 }) : okBody("ANSWER", STUB_DECLARED_MODEL)))
     try {
-      spawnDaemon(e.sock, e.spawnLog, { ANTHROPIC_BASE_URL: cap.url })
+      const { env } = spawnDaemon(e.home, e.spawnLog, { ANTHROPIC_BASE_URL: cap.url })
       await waitForSpawnLog(e.spawnLog, 1, 15_000)
-      const c = await connectNdjson(e.sock)
+      const c = await connectNdjson(env)
       await c.request("initialize", { protocolVersion: 1 })
       const s = await c.request("session/new", { cwd: process.cwd(), mcpServers: [], _meta: { kkamak: { isolation: TEST_ISOLATION } } })
       const updates: string[] = []
@@ -1151,12 +1097,12 @@ describe("acp-daemon over unix socket (reaches the stubbed model)", () => {
 
   test("an unreachable model endpoint AFTER the push -> ACP_ERR_CALL_CONSUMED, never NO_CALL", async () => {
     const e = tempEndpoint("unreachable"); LIVE.push(e)
-    spawnDaemon(e.sock, e.spawnLog, {
+    const { env } = spawnDaemon(e.home, e.spawnLog, {
       ANTHROPIC_BASE_URL: "http://127.0.0.1:9",
       KKAMAK_ACP_TURN_TIMEOUT_MS: String(AUTH_RESOLVE_BUDGET_MS),
     })
     await waitForSpawnLog(e.spawnLog, 1, 15_000)
-    const c = await connectNdjson(e.sock)
+    const c = await connectNdjson(env)
     await c.request("initialize", { protocolVersion: 1 })
     const s = await c.request("session/new", { cwd: process.cwd(), mcpServers: [], _meta: { kkamak: { isolation: TEST_ISOLATION } } })
     await expect(c.request("session/prompt", {
@@ -1166,99 +1112,38 @@ describe("acp-daemon over unix socket (reaches the stubbed model)", () => {
     c.close()
   }, DAEMON_TEST_TIMEOUT_MS)
 
-  // FINDING (Task 6), not a re-skip: same root cause as the cancel-notification
-  // test above — B's session/prompt + session/cancel are written in ONE
-  // socket write specifically so the cancel is dispatched in the same
-  // synchronous decode pass as the prompt, but ApiSession.drain has no
-  // yield point between dequeuing a turn and marking it sent, so the cancel
-  // always arrives one tick too late to preempt B's send. `bPromise`
-  // rejects ACP_ERR_CALL_CONSUMED instead of the asserted ACP_ERR_NO_CALL.
-  // See the cancel-notification test's comment for the full trace.
-  // test.todo, not .skip, for the same reason: an honest "known, understood,
-  // unfixed" marker (doesn't match Step 4b's skip grep) rather than a
-  // hidden failure — and critically, the body not running means this test's
-  // own cleanup gap (line 1196's `aPromise` assertion, and `cA.close();
-  // cB.close()`, both unreachable once line 1194's assertion throws first)
-  // can't leave `aPromise` dangling to reject later, mid a LATER test — this
-  // is exactly what was observed before: the "pool-exhausted" test below
-  // failed only when the whole file ran (never in isolation), because THIS
-  // test's uncaught, unconsumed `aPromise` settled asynchronously during
-  // that later test's run and bun:test attributed the unhandled rejection
-  // to whoever happened to be executing at that moment.
-  test.todo("session/cancel is SCOPED even when BOTH clients use the SAME JSON-RPC id", async () => {
-    const e = tempEndpoint("scoped-cancel"); LIVE.push(e)
-    const cap = hangFirstServer("ANSWER", STUB_DECLARED_MODEL)
-    try {
-      spawnDaemon(e.sock, e.spawnLog, {
-        ANTHROPIC_BASE_URL: cap.url,
-        KKAMAK_ACP_TURN_TIMEOUT_MS: String(AUTH_RESOLVE_BUDGET_MS),
-      })
-      await waitForSpawnLog(e.spawnLog, 1, 15_000)
-      const cA = await connectNdjson(e.sock)
-      const cB = await connectNdjson(e.sock)
-      await cA.request("initialize", { protocolVersion: 1 })
-      await cB.request("initialize", { protocolVersion: 1 })
-      const sA = await cA.request("session/new", { cwd: process.cwd(), mcpServers: [], _meta: { kkamak: { isolation: TEST_ISOLATION } } })
-
-      // A's prompt hangs (the stub's FIRST request never answers). Both
-      // connections start their own id counter at 1, so A's session/prompt
-      // (id=2, after initialize+session/new) and B's FIRST request will
-      // legitimately collide in id-space -- the scoping must come from the
-      // daemon-minted tag, never the wire id.
-      const aPromise = cA.request("session/prompt", {
-        sessionId: sA.sessionId, prompt: [{ type: "text", text: "A hangs" }],
-        _meta: { kkamak: { model: HAIKU } },
-      })
-      // A has provably crossed the send boundary once the stub observed a
-      // request (round-4 C3/I11) -- only then is B's cancel meaningful.
-      const crossed = await until(() => cap.count() >= 1, 30_000)
-      expect(crossed).toBe(true)
-
-      const sB = await cB.request("session/new", { cwd: process.cwd(), mcpServers: [], _meta: { kkamak: { isolation: TEST_ISOLATION } } })
-      // 2026-08-04 review finding: post-N3c-iii, B's prompt no longer
-      // queues behind a shared single WarmSession (that used to be an
-      // unbounded window a plain `request()`-then-`request()` pair could
-      // exploit for free) -- B now acquires its OWN pool entry and its OWN
-      // CLI subprocess starts spawning immediately (~1.3s window,
-      // measured). Two SEPARATE socket writes racing that window are not
-      // deterministic under load (measured: 1016/1 in an independent run,
-      // B landing ACP_ERR_CALL_CONSUMED instead of the asserted no-call).
-      // `requestBatch` writes B's session/prompt AND session/cancel in ONE
-      // socket write, so the daemon decodes and dispatches both in the
-      // SAME synchronous for-loop pass -- cancel is guaranteed to run
-      // before B's turn ever reaches its first real await (the SDK's
-      // dynamic import), long before the send boundary. B's own id
-      // counter is still whatever it is at this point (which, by
-      // construction, may equal one of A's ids) -- the scoping must come
-      // from the daemon-minted tag, never the wire id, same as before.
-      const [bPromise, bCancelAckPromise] = cB.requestBatch([
-        { method: "session/prompt", params: {
-          sessionId: sB.sessionId, prompt: [{ type: "text", text: "B cancelled pre-send" }],
-          _meta: { kkamak: { model: HAIKU } },
-        } },
-        { method: "session/cancel", params: { sessionId: sB.sessionId } },
-      ])
-      await bCancelAckPromise
-
-      await expect(bPromise).rejects.toMatchObject({ code: ACP_ERR_NO_CALL, data: { callConsumed: false } })
-      // A must never be cancelled by B -- it ends on its OWN turn timeout.
-      await expect(aPromise).rejects.toMatchObject({ code: ACP_ERR_CALL_CONSUMED, data: { callConsumed: true } })
-      cA.close(); cB.close()
-    } finally { cap.stop() }
-  }, DAEMON_TEST_TIMEOUT_MS)
+  // RETIRED, not fixed and not re-skipped (websocket-transport plan, Task
+  // 3 Step 2) — same reason as the cancel-notification test above: this
+  // test's premise was B's session/prompt + session/cancel written in ONE
+  // socket write so the daemon decoded and dispatched both in ONE
+  // synchronous pass, guaranteeing the cancel reached ApiSession before
+  // B's send boundary. That premise is unconstructible over WebSocket —
+  // each `.send()` is its own message, its own event-loop turn, with no
+  // "same chunk" left to force two of them into. The underlying finding
+  // (ApiSession.drain has no yield point between dequeuing a turn and the
+  // send boundary) is unaffected by the transport and still true; this
+  // test just can no longer express the premise it needs to exercise it.
+  //
+  // Also resolves a knock-on effect from the OLD unix-socket version: that
+  // test's own `test.todo` conversion (Task 6) was itself a fix for a
+  // dangling-promise leak (`aPromise`, uncaught once an earlier assertion
+  // threw first, settling asynchronously mid a LATER test and getting its
+  // unhandled rejection misattributed to whoever was running at that
+  // moment) — deleting the test outright removes that leak's source
+  // entirely, not just its symptom.
 
   test("N3c-iii test 3: pool-exhausted (cap 1) -> -32002 with data.callConsumed false, and the stub captured exactly one request", async () => {
     const e = tempEndpoint("poolexhausted"); LIVE.push(e)
     const cap = hangFirstServer("ANSWER", STUB_DECLARED_MODEL)
     try {
-      spawnDaemon(e.sock, e.spawnLog, {
+      const { env } = spawnDaemon(e.home, e.spawnLog, {
         ANTHROPIC_BASE_URL: cap.url,
         KKAMAK_ACP_MAX_SESSIONS: "1",
         KKAMAK_ACP_TURN_TIMEOUT_MS: String(AUTH_RESOLVE_BUDGET_MS),
       })
       await waitForSpawnLog(e.spawnLog, 1, 15_000)
-      const cA = await connectNdjson(e.sock)
-      const cB = await connectNdjson(e.sock)
+      const cA = await connectNdjson(env)
+      const cB = await connectNdjson(env)
       await cA.request("initialize", { protocolVersion: 1 })
       await cB.request("initialize", { protocolVersion: 1 })
       const sA = await cA.request("session/new", { cwd: process.cwd(), mcpServers: [], _meta: { kkamak: { isolation: TEST_ISOLATION } } })

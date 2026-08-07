@@ -68,33 +68,86 @@ export function envFingerprint(env: Record<string, string | undefined>): string 
   return crypto.createHash("sha256").update(lines.join("\n") + "\n").digest("hex").slice(0, 12)
 }
 
-export function isPipe(p: string): boolean { return p.startsWith("\\\\.\\pipe\\") }
-
-export function socketPath(env: Record<string, string | undefined>): string {
-  if (env.KKAMAK_ACP_SOCKET) return env.KKAMAK_ACP_SOCKET
+/** websocket-transport swap: replaces `socketPath`. A unix socket path
+ * doubled as a self-organizing registry — the fingerprint WAS the address,
+ * so "does a daemon exist for this env" and "where do I reach it" were the
+ * same question. A TCP port carries no fingerprint, so the mapping has to
+ * become an artifact: a small JSON file at the SAME fingerprint-derived
+ * location the socket used to occupy, holding `{port, pid}`.
+ *
+ * `env.HOME` is consulted explicitly, ahead of `os.homedir()` — this is
+ * NOT cosmetic. `os.homedir()` reads the CURRENT process's real
+ * environment; it has no way to see a `HOME` field inside a plain `env`
+ * object a caller merely PASSED IN. Two callers rely on that distinction:
+ * (1) a spawned daemon subprocess, whose `Bun.spawn({env})` REPLACES its
+ * OWN process.env wholesale (acp-client.ts's spawnDaemonProcess), so its
+ * own `os.homedir()` already agrees with `env.HOME` — the explicit check
+ * is redundant but harmless there; (2) a TEST or client process calling
+ * `discoveryPath(someEnv)`/`readDiscovery(someEnv)` on a plain object
+ * that is NOT its own process.env, where `os.homedir()` would silently
+ * return the REAL host's home directory regardless of what `someEnv.HOME`
+ * says — exactly the isolation escape a per-test HOME override exists to
+ * prevent. */
+export function discoveryPath(env: Record<string, string | undefined>): string {
+  const home = env.HOME || os.homedir()
   const fp = envFingerprint(env)
-  if (process.platform === "win32") return `\\\\.\\pipe\\kkamak-acp-${os.userInfo().username}-${fp}`
-  return path.join(os.homedir(), ".config", "kkamak", `acp-${fp}.sock`)
+  return path.join(home, ".config", "kkamak", `acp-${fp}.json`)
+}
+
+export interface DiscoveryInfo {
+  port: number
+  pid: number
+}
+
+/** Never throws — a missing, unreadable, or malformed file all collapse to
+ * `undefined`, same discipline as `resolveAuth`/`readDiscovery`'s
+ * neighbors in this module. Structural-only: does NOT probe whether `port`
+ * is still live — that is a connect attempt, the caller's job (ensureDaemon
+ * / the daemon's own bind takeover), not a filesystem read's. */
+export function readDiscovery(env: Record<string, string | undefined>): DiscoveryInfo | undefined {
+  try {
+    const raw = fs.readFileSync(discoveryPath(env), "utf-8")
+    const parsed = JSON.parse(raw) as Partial<DiscoveryInfo> | null
+    if (typeof parsed?.port !== "number" || typeof parsed?.pid !== "number") return undefined
+    return { port: parsed.port, pid: parsed.pid }
+  } catch {
+    return undefined
+  }
+}
+
+/** MAY THROW (EACCES on an unwritable parent) — same fail-open contract as
+ * the old `ensureSocketDir`: callers that need never-throws (ensureDaemon)
+ * own that wrapping, not this function. Directory `0700`, file `0600` — the
+ * RULING declines to authenticate the WebSocket handshake itself, but
+ * there is no reason to make the port world-readable when the socket dir
+ * never was; this costs nothing and keeps the file honest about who owns
+ * it. Call ONLY after a successful bind (acp-daemon.ts) — publishing before
+ * that would let a discovery file mean "someone is about to listen here"
+ * instead of "someone IS listening here", which is what makes a client
+ * that reads it safe to dial without an extra existence race. */
+export function writeDiscovery(env: Record<string, string | undefined>, info: DiscoveryInfo): void {
+  const p = discoveryPath(env)
+  fs.mkdirSync(path.dirname(p), { recursive: true, mode: 0o700 })
+  fs.writeFileSync(p, JSON.stringify(info), { mode: 0o600 })
+  try { fs.chmodSync(p, 0o600) } catch { /* best-effort, matches the old socket chmod's own discipline */ }
+}
+
+export function wsUrl(port: number): string {
+  return `ws://127.0.0.1:${port}`
 }
 
 /** TWO locks, deliberately. The CLIENT holds `.spawn.lock` from "decide to
  * spawn" until the daemon answers `initialize`; the DAEMON holds
  * `.bind.lock` across probe->unlink->rebind. One shared file deadlocks: the
- * client would still hold it while the daemon it started tried to bind. */
+ * client would still hold it while the daemon it started tried to bind.
+ * Re-derived from `discoveryPath` now (was `socketPath`) — the two-lock
+ * protocol itself is transport-independent, only the address it hangs off
+ * of changed. */
 export function spawnLockPath(env: Record<string, string | undefined>): string {
-  return `${socketPath(env)}.spawn.lock`
+  return `${discoveryPath(env)}.spawn.lock`
 }
 export function bindLockPath(env: Record<string, string | undefined>): string {
-  return `${socketPath(env)}.bind.lock`
-}
-
-/** MAY THROW (EACCES on an unwritable parent). Callers own the fail-open
- * wrapping — `ensureDaemon`'s NEVER-throws contract is what turns an
- * unwritable socket dir into an exit-0 SessionStart no-op. No-op for a named
- * pipe path: there is no filesystem parent to create. */
-export function ensureSocketDir(p: string): void {
-  if (isPipe(p)) return
-  fs.mkdirSync(path.dirname(p), { recursive: true, mode: 0o700 })
+  return `${discoveryPath(env)}.bind.lock`
 }
 
 /** Staleness discipline shaped EXACTLY on corpus-store.ts:134-177 —

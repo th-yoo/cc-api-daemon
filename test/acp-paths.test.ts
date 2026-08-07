@@ -4,16 +4,22 @@ import fs from "node:fs"
 import path from "node:path"
 import { tmpdir } from "node:os"
 import {
-  envFingerprint, socketPath, spawnLockPath, bindLockPath, ACP_ENV_DENYLIST,
-  ensureSocketDir, isPipe, tryCreateLock, isLockStale, acquireAcpLock, releaseAcpLock,
+  envFingerprint, discoveryPath, readDiscovery, writeDiscovery, wsUrl,
+  spawnLockPath, bindLockPath, ACP_ENV_DENYLIST,
+  tryCreateLock, isLockStale, acquireAcpLock, releaseAcpLock,
   ACP_LOCK_STALE_MS,
 } from "../src/acp-paths.ts"
 
 /** Every test builds its OWN path under tmpdir. NO TEST MAY EVER TOUCH
  * ~/.config/kkamak/ — this file only exercises path/hash/lock logic against
- * temp files, never the real default socketPath(). */
+ * temp files, never the real default discoveryPath() (i.e. never calls it
+ * without an explicit env.HOME override). */
 function tempPath(tag: string): string {
   return path.join(tmpdir(), `kkamak-acp-paths-${tag}-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`)
+}
+
+function tmpHome(): string {
+  return fs.mkdtempSync(path.join(tmpdir(), "kkamak-acp-paths-home-"))
 }
 
 describe("acp-paths", () => {
@@ -56,7 +62,11 @@ describe("acp-paths", () => {
     // that is not "one extra daemon", it is 100% silent fallback forever.
     expect(ACP_ENV_DENYLIST.includes("KKAMAK_GAUGE_TRANSPORT")).toBe(true)
     expect(envFingerprint({ KKAMAK_GAUGE_TRANSPORT: "agent-sdk-daemon" })).toBe(envFingerprint({}))
-    // KKAMAK_ACP_SOCKET is where to reach the instrument, not what it is.
+    // KKAMAK_ACP_SOCKET is vestigial post-transport-swap (no more socket
+    // path to override) but stays in the denylist unchanged — envFingerprint
+    // is required to stay "exactly as-is" (websocket-transport plan, Task
+    // 2), and a stray KKAMAK_ACP_SOCKET key in some caller's env must still
+    // never perturb the fingerprint, whether or not anything sets it anymore.
     expect(ACP_ENV_DENYLIST.includes("KKAMAK_ACP_SOCKET")).toBe(true)
     expect(envFingerprint({ KKAMAK_ACP_SOCKET: "/tmp/a.sock" }))
       .toBe(envFingerprint({ KKAMAK_ACP_SOCKET: "/tmp/b.sock" }))
@@ -73,54 +83,63 @@ describe("acp-paths", () => {
   test("key ORDER in the object does not change the fingerprint (keys are sorted)", () => {
     expect(envFingerprint({ A: "1", B: "2" })).toBe(envFingerprint({ B: "2", A: "1" }))
   })
-  test("no secret VALUE can appear in a socket path", () => {
-    const p = socketPath({ ANTHROPIC_API_KEY: "sk-super-secret-value" })
+
+  test("the discovery path is keyed by fingerprint, like the socket path was", () => {
+    const home = tmpHome()
+    const a = discoveryPath({ HOME: home, FOO: "1" })
+    const b = discoveryPath({ HOME: home, FOO: "2" })
+    expect(a).not.toBe(b)
+    expect(a.endsWith(".json")).toBe(true)
+  })
+  test("a secret's VALUE never reaches the discovery filename", () => {
+    const p = discoveryPath({ HOME: tmpHome(), ANTHROPIC_API_KEY: "sk-super-secret-value" })
     expect(p).not.toContain("sk-super-secret-value")
   })
-  test("the default socket path carries the fingerprint; the override wins verbatim", () => {
-    const p = socketPath({ ANTHROPIC_BASE_URL: "http://a" })
-    expect(p).toContain(".config/kkamak/acp-")
-    expect(p.endsWith(".sock")).toBe(true)
-    expect(socketPath({ KKAMAK_ACP_SOCKET: "/tmp/x.sock" })).toBe("/tmp/x.sock")
+  test("env.HOME wins over the real host home — the isolation lever ensureDaemon/tests rely on", () => {
+    const p = discoveryPath({ HOME: "/nonexistent/fake-home" })
+    expect(p.startsWith("/nonexistent/fake-home")).toBe(true)
   })
-  test("the spawn lock and the bind lock are DIFFERENT files (they guard different critical sections)", () => {
-    const env = { KKAMAK_ACP_SOCKET: "/tmp/x.sock" }
-    expect(spawnLockPath(env)).not.toBe(bindLockPath(env))
-  })
-  test("isPipe recognizes the win32 named-pipe form only", () => {
-    expect(isPipe(`\\\\.\\pipe\\kkamak-acp-user-abc123`)).toBe(true)
-    expect(isPipe("/home/x/.config/kkamak/acp-abc123.sock")).toBe(false)
-  })
-})
 
-describe("acp-paths — ensureSocketDir", () => {
-  test("creates the parent dir 0700 for a fresh socket path", () => {
-    const sock = path.join(tempPath("dir"), "nested", "acp-x.sock")
-    ensureSocketDir(sock)
-    const st = fs.statSync(path.dirname(sock))
-    expect(st.isDirectory()).toBe(true)
-    expect(st.mode & 0o777).toBe(0o700)
+  test("write then read round-trips", () => {
+    const env = { HOME: tmpHome(), KKAMAK_TEST: "rt" }
+    writeDiscovery(env, { port: 45123, pid: 999 })
+    expect(readDiscovery(env)).toMatchObject({ port: 45123, pid: 999 })
   })
-  test("is a no-op for a named pipe path (no filesystem parent to create)", () => {
-    // Must not throw, must not touch the filesystem.
-    expect(() => ensureSocketDir(`\\\\.\\pipe\\kkamak-acp-user-abc123`)).not.toThrow()
+  test("a missing discovery file reads as undefined, not a throw", () => {
+    expect(readDiscovery({ HOME: tmpHome(), KKAMAK_TEST: "absent" })).toBeUndefined()
   })
-  test("MAY throw when the parent cannot be created (e.g. a path segment is a plain file, not a dir)", () => {
-    const blocker = tempPath("blocker-file")
-    fs.writeFileSync(blocker, "not a directory")
-    const sock = path.join(blocker, "sub", "acp-x.sock")
-    expect(() => ensureSocketDir(sock)).toThrow()
+  test("a malformed discovery file (torn JSON, or missing fields) reads as undefined, not a throw", () => {
+    const home = tmpHome()
+    const p = discoveryPath({ HOME: home })
+    fs.mkdirSync(path.dirname(p), { recursive: true })
+    fs.writeFileSync(p, "{not json")
+    expect(readDiscovery({ HOME: home })).toBeUndefined()
+
+    const home2 = tmpHome()
+    const p2 = discoveryPath({ HOME: home2 })
+    fs.mkdirSync(path.dirname(p2), { recursive: true })
+    fs.writeFileSync(p2, JSON.stringify({ port: "not-a-number" }))
+    expect(readDiscovery({ HOME: home2 })).toBeUndefined()
   })
-  test("MAY throw EACCES — the error class the contract's own comment actually names (unwritable parent)", () => {
-    const parent = tempPath("eacces-parent")
-    fs.mkdirSync(parent, { mode: 0o500 }) // read+execute, no write
-    const sock = path.join(parent, "sub", "acp-x.sock")
-    try {
-      expect(() => ensureSocketDir(sock)).toThrow()
-    } finally {
-      fs.chmodSync(parent, 0o700)
-      fs.rmSync(parent, { recursive: true, force: true })
-    }
+  test("writeDiscovery creates the parent dir 0700 and the file 0600", () => {
+    const home = tmpHome()
+    const env = { HOME: home }
+    writeDiscovery(env, { port: 1, pid: 2 })
+    const p = discoveryPath(env)
+    const dirSt = fs.statSync(path.dirname(p))
+    expect(dirSt.isDirectory()).toBe(true)
+    expect(dirSt.mode & 0o777).toBe(0o700)
+    const fileSt = fs.statSync(p)
+    expect(fileSt.mode & 0o777).toBe(0o600)
+  })
+
+  test("wsUrl builds a loopback URL for the given port", () => {
+    expect(wsUrl(45123)).toBe("ws://127.0.0.1:45123")
+  })
+
+  test("the spawn lock and the bind lock are DIFFERENT files (they guard different critical sections)", () => {
+    const env = { HOME: tmpHome() }
+    expect(spawnLockPath(env)).not.toBe(bindLockPath(env))
   })
 })
 

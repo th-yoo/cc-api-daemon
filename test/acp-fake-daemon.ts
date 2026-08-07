@@ -1,5 +1,5 @@
-// test/acp-fake-daemon.ts — a scripted ACP daemon on a unix socket: no
-// WarmSession, no CLI, no model. Shared by Tasks 6 and 7 so the two suites
+// test/acp-fake-daemon.ts — a scripted ACP daemon over WebSocket: no
+// WarmSession, no CLI, no model. Shared by acp-client.test.ts so the suite
 // cannot drift on the fingerprint echo — a fake that echoes the WRONG
 // fingerprint makes every client call a silent law-L1 no-call, which looks
 // like a routing bug and is not one. NOT matched by bun's test glob (no
@@ -11,14 +11,20 @@
 // BEFORE the session/prompt result (acp-daemon.ts's own ordering — a client
 // racing on the result must not miss the chunk), and failures are JSON-RPC
 // errors carrying `data.callConsumed`, never a fake stopReason.
+//
+// websocket-transport swap: takes `env` now, not a raw socket path —
+// `daemonCall`/`ensureDaemon` locate a daemon via `readDiscovery(env)`, so
+// this fake must publish ITS OWN port to the SAME discovery file the
+// client under test will read, under whatever `HOME` that env carries.
 import fs from "node:fs"
-import net from "node:net"
+import http from "node:http"
 import crypto from "node:crypto"
+import { WebSocketServer, type WebSocket } from "ws"
 import {
-  FrameDecoder, encodeFrame,
   ACP_INITIALIZE, ACP_SESSION_NEW, ACP_SESSION_PROMPT, ACP_SESSION_CANCEL, ACP_SESSION_UPDATE,
   ACP_SESSION_CLOSE, ACP_ERR_NO_CALL, ACP_ERR_CALL_CONSUMED,
 } from "../src/acp-wire.ts"
+import { discoveryPath, writeDiscovery } from "../src/acp-paths.ts"
 
 export type FakeAnswer =
   | "ok"
@@ -94,17 +100,13 @@ export interface FakeDaemonHandle {
   closeParams: () => { sessionId: string } | undefined
 }
 
-export function fakeDaemon(sock: string, opts: FakeDaemonOpts): FakeDaemonHandle {
+export async function fakeDaemon(env: Record<string, string | undefined>, opts: FakeDaemonOpts): Promise<FakeDaemonHandle> {
   let sawPromptFlag = false
   let captured: FakePromptParams | undefined
   let capturedSessionNew: FakeSessionNewParams | undefined
   let capturedClose: { sessionId: string } | undefined
 
-  // Fresh socket path per test (tempEndpoint-shaped), but tolerate a stale
-  // leftover file the same way acp-daemon.ts's own takeover logic does.
-  try { fs.unlinkSync(sock) } catch { /* absent — fine */ }
-
-  const sockets = new Set<net.Socket>()
+  const clients = new Set<WebSocket>()
 
   function respondPrompt(write: (msg: object) => void, id: number | string, sessionId: string, requestedModel: string): void {
     switch (opts.answer) {
@@ -156,94 +158,101 @@ export function fakeDaemon(sock: string, opts: FakeDaemonOpts): FakeDaemonHandle
         // never respond — the client's budget timer owns this case.
         return
       case "die-before-prompt":
-        // unreachable: the socket is destroyed right after session/new, so
+        // unreachable: the connection is closed right after session/new, so
         // this daemon never receives a session/prompt frame at all.
         return
     }
   }
 
-  const server = net.createServer((socket) => {
-    sockets.add(socket)
-    socket.setEncoding("utf8")
-    const decoder = new FrameDecoder()
+  const wss = new WebSocketServer({ noServer: true })
+  const server = http.createServer()
+  server.on("upgrade", (req, socket, head) => {
+    wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req))
+  })
+
+  wss.on("connection", (ws: WebSocket) => {
+    clients.add(ws)
     const write = (msg: object): void => {
-      try { socket.write(encodeFrame(msg)) } catch { /* peer gone */ }
+      try { ws.send(JSON.stringify(msg)) } catch { /* peer gone */ }
     }
 
-    socket.on("data", (chunk) => {
-      for (const f of decoder.push(chunk)) {
-        const req = f as { id?: number | string; method?: unknown; params?: unknown }
-        const id = req.id
-        const method = typeof req.method === "string" ? req.method : ""
-        const params = req.params
+    ws.on("message", (data) => {
+      let f: unknown
+      try { f = JSON.parse(String(data)) } catch { return }
+      const req = f as { id?: number | string; method?: unknown; params?: unknown }
+      const id = req.id
+      const method = typeof req.method === "string" ? req.method : ""
+      const params = req.params
 
-        switch (method) {
-          case ACP_INITIALIZE: {
-            if (id === undefined) break
-            const kkamak: { envFingerprint: string; daemonWorstCaseMs?: number } = { envFingerprint: opts.fingerprint }
-            if (opts.daemonWorstCaseMs !== undefined) kkamak.daemonWorstCaseMs = opts.daemonWorstCaseMs
-            write({
-              jsonrpc: "2.0", id,
-              result: { protocolVersion: 1, agentCapabilities: { loadSession: false }, _meta: { kkamak } },
-            })
-            break
-          }
-          case ACP_SESSION_NEW: {
-            capturedSessionNew = params as FakeSessionNewParams | undefined
-            if (id === undefined) break
-            const sessionId = crypto.randomUUID()
-            if (opts.answer === "die-before-prompt") {
-              // Answer, THEN destroy — only once the response has actually
-              // been handed to the OS, so the client's session/new promise
-              // resolves before its socket dies.
-              try {
-                socket.write(encodeFrame({ jsonrpc: "2.0", id, result: { sessionId } }), () => {
-                  try { socket.destroy() } catch { /* ignore */ }
-                })
-              } catch { /* ignore */ }
-              break
-            }
-            write({ jsonrpc: "2.0", id, result: { sessionId } })
-            break
-          }
-          case ACP_SESSION_PROMPT: {
-            sawPromptFlag = true
-            const p = params as { sessionId?: unknown; prompt?: Array<{ type: "text"; text: string }>; _meta?: { kkamak?: { model?: unknown } } } | undefined
-            const sessionId = typeof p?.sessionId === "string" ? p.sessionId : ""
-            const requestedModel = typeof p?._meta?.kkamak?.model === "string" ? p._meta.kkamak.model : ""
-            captured = { sessionId, prompt: p?.prompt ?? [], _meta: { model: requestedModel } }
-            if (id === undefined) break
-            respondPrompt(write, id, sessionId, requestedModel)
-            break
-          }
-          case ACP_SESSION_CANCEL: {
-            if (id !== undefined) write({ jsonrpc: "2.0", id, result: {} })
-            break
-          }
-          case ACP_SESSION_CLOSE: {
-            const p = params as { sessionId?: unknown } | undefined
-            const sessionId = typeof p?.sessionId === "string" ? p.sessionId : ""
-            capturedClose = { sessionId }
-            if (id !== undefined) write({ jsonrpc: "2.0", id, result: { closed: true } })
-            break
-          }
-          default:
-            if (id !== undefined) write({ jsonrpc: "2.0", id, error: { code: -32601, message: `unknown method: ${method}` } })
+      switch (method) {
+        case ACP_INITIALIZE: {
+          if (id === undefined) break
+          const kkamak: { envFingerprint: string; daemonWorstCaseMs?: number } = { envFingerprint: opts.fingerprint }
+          if (opts.daemonWorstCaseMs !== undefined) kkamak.daemonWorstCaseMs = opts.daemonWorstCaseMs
+          write({
+            jsonrpc: "2.0", id,
+            result: { protocolVersion: 1, agentCapabilities: { loadSession: false }, _meta: { kkamak } },
+          })
+          break
         }
+        case ACP_SESSION_NEW: {
+          capturedSessionNew = params as FakeSessionNewParams | undefined
+          if (id === undefined) break
+          const sessionId = crypto.randomUUID()
+          if (opts.answer === "die-before-prompt") {
+            // Answer, THEN close — the client's session/new promise must
+            // resolve before this connection dies.
+            write({ jsonrpc: "2.0", id, result: { sessionId } })
+            try { ws.close() } catch { /* ignore */ }
+            break
+          }
+          write({ jsonrpc: "2.0", id, result: { sessionId } })
+          break
+        }
+        case ACP_SESSION_PROMPT: {
+          sawPromptFlag = true
+          const p = params as { sessionId?: unknown; prompt?: Array<{ type: "text"; text: string }>; _meta?: { kkamak?: { model?: unknown } } } | undefined
+          const sessionId = typeof p?.sessionId === "string" ? p.sessionId : ""
+          const requestedModel = typeof p?._meta?.kkamak?.model === "string" ? p._meta.kkamak.model : ""
+          captured = { sessionId, prompt: p?.prompt ?? [], _meta: { model: requestedModel } }
+          if (id === undefined) break
+          respondPrompt(write, id, sessionId, requestedModel)
+          break
+        }
+        case ACP_SESSION_CANCEL: {
+          if (id !== undefined) write({ jsonrpc: "2.0", id, result: {} })
+          break
+        }
+        case ACP_SESSION_CLOSE: {
+          const p = params as { sessionId?: unknown } | undefined
+          const sessionId = typeof p?.sessionId === "string" ? p.sessionId : ""
+          capturedClose = { sessionId }
+          if (id !== undefined) write({ jsonrpc: "2.0", id, result: { closed: true } })
+          break
+        }
+        default:
+          if (id !== undefined) write({ jsonrpc: "2.0", id, error: { code: -32601, message: `unknown method: ${method}` } })
       }
     })
-    socket.on("error", () => { /* a peer reset must never crash the fake */ })
-    socket.on("close", () => { sockets.delete(socket) })
+    ws.on("error", () => { /* a peer reset must never crash the fake */ })
+    ws.on("close", () => { clients.delete(ws) })
   })
 
   server.on("error", () => { /* never crash the test process */ })
-  server.listen(sock)
+  // `.listen()`'s bind is not guaranteed synchronous — await the
+  // `listening` event before trusting `.address()` rather than racing it.
+  await new Promise<void>((resolve) => { server.listen(0, "127.0.0.1", resolve) })
+  const address = server.address()
+  if (address === null || typeof address === "string") {
+    throw new Error("fakeDaemon: server.address() returned no port after listen")
+  }
+  writeDiscovery(env, { port: address.port, pid: process.pid })
 
   return {
     stop() {
-      for (const s of sockets) { try { s.destroy() } catch { /* ignore */ } }
+      for (const ws of clients) { try { ws.terminate() } catch { /* ignore */ } }
       try { server.close() } catch { /* ignore */ }
-      try { fs.unlinkSync(sock) } catch { /* ignore */ }
+      try { fs.rmSync(discoveryPath(env), { force: true }) } catch { /* ignore */ }
     },
     sawPrompt: () => sawPromptFlag,
     promptParams: () => captured,

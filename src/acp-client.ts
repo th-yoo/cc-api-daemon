@@ -7,14 +7,38 @@
 // on hook-cli.ts's eager import path (transport.ts, imported at
 // hook-cli.ts:24) must be able to import THIS module without transitively
 // pulling in anything that can start a server.
-import net from "node:net"
+//
+// websocket-transport swap: `net.connect(socketPath(env))` becomes
+// `readDiscovery(env)` -> `new WebSocket(wsUrl(port))` — the GLOBAL,
+// browser-standard WebSocket (Bun/Node both implement it natively), NOT
+// the `ws` package's own client class; the daemon side (acp-daemon.ts)
+// uses `ws` only for its SERVER half (`WebSocketServer`), which has no
+// browser-standard equivalent. `FrameDecoder`/`encodeFrame` are gone from
+// this file entirely — a WebSocket message IS a frame, so
+// `JSON.stringify`/`JSON.parse` directly replace them.
+//
+// SEND-BOUNDARY MECHANICS, ADAPTED: the old code set `sentPrompt = true`
+// inside `socket.write(frame, callback)`'s CALLBACK — an OS-level
+// confirmation that the write syscall itself succeeded. The global
+// `WebSocket.send()` has no such callback (unlike `ws`'s own client class,
+// which does); it either throws SYNCHRONOUSLY (the frame provably never
+// left this process — still safely `no-call`, same as a synchronous
+// `socket.write` throw before) or returns void having handed the frame to
+// the platform's own send buffer. `sentPrompt` is therefore set
+// immediately after a non-throwing `send()` returns, not after an
+// independent completion signal. This crosses the boundary marginally
+// EARLIER than before, which is the SAFE direction for §6e's law: it can
+// only convert a would-be `no-call` into a `call-consumed`, never the
+// reverse (falsely claiming a sent prompt was never sent is the direction
+// the law forbids; the opposite bias is exactly what "when in doubt,
+// call-consumed" already asks for).
 import path from "node:path"
 import {
-  socketPath, ensureSocketDir, spawnLockPath, envFingerprint,
+  readDiscovery, wsUrl, spawnLockPath, envFingerprint,
   acquireAcpLock, releaseAcpLock,
 } from "./acp-paths.ts"
 import {
-  FrameDecoder, encodeFrame, ACP_BUDGET,
+  ACP_BUDGET,
   ACP_INITIALIZE, ACP_SESSION_NEW, ACP_SESSION_PROMPT, ACP_SESSION_UPDATE, ACP_SESSION_CLOSE,
   ACP_ERR_NO_CALL, ACP_ERR_CALL_CONSUMED,
   type AcpInitializeResult, type AcpNewSessionParams, type AcpNewSessionResult,
@@ -107,28 +131,28 @@ export function daemonCall(
   opts: { isolation: WarmIsolation; budgetMs?: number },
 ): Promise<DaemonOutcome> {
   const budgetMs = opts.budgetMs ?? ACP_BUDGET.clientBudgetMs
-  const sock = socketPath(env)
   const fp = envFingerprint(env)
 
   return new Promise<DaemonOutcome>((resolve) => {
     let settled = false
-    // §6e's client-side send boundary: ONE boolean, assigned ONLY in the
-    // prompt frame's write callback below. Nothing else in this file writes
-    // to it.
+    // §6e's client-side send boundary: ONE boolean, assigned ONLY right
+    // after a non-throwing `ws.send()` for the prompt frame below (see
+    // this file's header comment for why that is the WebSocket-equivalent
+    // moment, not a write callback). Nothing else in this file writes to it.
     let sentPrompt = false
     let lastUpdateText: string | undefined
     let nextId = 1
     const pending = new Map<number, PendingEntry>()
 
-    // Construct the socket UNCONNECTED and attach every listener (including
-    // 'error') BEFORE calling `.connect()` — measured under `bun test`
-    // 1.3.1: `net.connect(path)` to a nonexistent path can deliver its
-    // 'error' event before a listener attached on the NEXT line ever
-    // registers, which (an EventEmitter 'error' with no listener) throws as
-    // an uncaught exception instead of producing a `no-call` outcome. A
-    // `new net.Socket()` + listen-then-`.connect()` sequence closes that
-    // window; `bun run` alone never showed the race, only `bun test` did.
-    const socket = new net.Socket()
+    // No discovery file at all -> no daemon reachable, full stop -- law
+    // L1, no-call, and FASTER than the old code's "attempt a doomed
+    // connect, wait for connection-refused" path (this never even opens a
+    // socket).
+    const discovery = readDiscovery(env)
+    if (!discovery) {
+      resolve({ kind: "no-call" })
+      return
+    }
 
     let timer: ReturnType<typeof setTimeout> | undefined = setTimeout(() => {
       finish(sentPrompt ? { kind: "call-consumed" } : { kind: "no-call" })
@@ -138,74 +162,70 @@ export function daemonCall(
       if (settled) return
       settled = true
       if (timer) { clearTimeout(timer); timer = undefined }
-      try { socket.destroy() } catch { /* ignore */ }
+      try { ws.close() } catch { /* ignore */ }
       resolve(outcome)
     }
+
+    const ws = new WebSocket(wsUrl(discovery.port))
 
     // Ambient guard: any connection-level failure at ANY point resolves via
     // the sentPrompt boundary alone — before the boundary that is always
     // no-call (nothing could have been delivered), after it that is always
     // call-consumed (the daemon may already have acted on the bytes).
-    socket.once("error", () => finish(sentPrompt ? { kind: "call-consumed" } : { kind: "no-call" }))
-    socket.once("close", () => finish(sentPrompt ? { kind: "call-consumed" } : { kind: "no-call" }))
+    // `addEventListener` (not `.onerror`/`.onclose`) deliberately — this
+    // file needs a SECOND, independent 'error' listener below for the
+    // connect-wait promise, and the single-slot `.onX` properties would
+    // let the second assignment silently clobber this one.
+    ws.addEventListener("error", () => finish(sentPrompt ? { kind: "call-consumed" } : { kind: "no-call" }))
+    ws.addEventListener("close", () => finish(sentPrompt ? { kind: "call-consumed" } : { kind: "no-call" }))
 
-    // The connect-wait promise, registered BEFORE `.connect()` is called
-    // below — mirrors `probeOnce`'s ordering. Review finding (round after
-    // 420b2ce): this listener used to be attached inside `run()`, AFTER
-    // `.connect()` had already run, which is the exact same-tick
-    // event-delivery race deviation 1's header comment closes for 'error'
-    // — left open here for 'connect'. The ambient `once("error")` above
-    // already protects the error half regardless of ordering, so only
-    // 'connect' was actually exposed: if bun test 1.3.1 ever delivers
-    // 'connect' before a listener attached on a later line, `run()` would
-    // await forever and the call would burn the full budget against a
-    // HEALTHY daemon before falling back. Attaching here, before
-    // `socket.connect(sock)`, closes that window the same way deviation 1
-    // closes it for 'error'.
+    // The connect-wait promise, registered BEFORE anything else awaits it —
+    // mirrors `probeOnce`'s ordering. The ambient `error` listener above
+    // already protects the error half regardless of ordering; this second,
+    // independent listener is what lets `run()` below actually observe the
+    // failure and return promptly instead of relying solely on the
+    // deadline timer.
     const connected = new Promise<void>((res, rej) => {
-      socket.once("connect", () => res())
-      socket.once("error", rej)
+      ws.addEventListener("open", () => res())
+      ws.addEventListener("error", () => rej(new Error("connect failed")))
     })
-
-    // Second layer over FrameDecoder's own StringDecoder on the
-    // split-multibyte hazard, matching the daemon (Task 5).
-    socket.setEncoding("utf8")
-    const decoder = new FrameDecoder()
-    socket.connect(sock)
 
     function request(method: string, params?: unknown): Promise<unknown> {
       const id = nextId++
       return new Promise((res, rej) => {
         pending.set(id, { resolve: res, reject: rej })
-        socket.write(encodeFrame({ jsonrpc: "2.0", id, method, params }), (err) => {
-          if (err) { pending.delete(id); rej(err) }
-        })
+        try {
+          ws.send(JSON.stringify({ jsonrpc: "2.0", id, method, params }))
+        } catch (err) {
+          pending.delete(id)
+          rej(err)
+        }
       })
     }
 
-    socket.on("data", (chunk) => {
-      for (const f of decoder.push(chunk)) {
-        const msg = f as {
-          id?: number | string
-          method?: string
-          params?: unknown
-          result?: unknown
-          error?: { code: number; message: string; data?: unknown }
-        }
-        if (msg.id === undefined && msg.method === ACP_SESSION_UPDATE) {
-          const p = msg.params as { update?: { content?: { text?: unknown } } } | undefined
-          const text = p?.update?.content?.text
-          if (typeof text === "string") lastUpdateText = text
-          continue
-        }
-        if (typeof msg.id === "number" && pending.has(msg.id)) {
-          const entry = pending.get(msg.id)!
-          pending.delete(msg.id)
-          if (msg.error) {
-            entry.reject(Object.assign(new Error(msg.error.message), { code: msg.error.code, data: msg.error.data }))
-          } else {
-            entry.resolve(msg.result)
-          }
+    ws.addEventListener("message", (ev: MessageEvent) => {
+      let f: unknown
+      try { f = JSON.parse(String(ev.data)) } catch { return }
+      const msg = f as {
+        id?: number | string
+        method?: string
+        params?: unknown
+        result?: unknown
+        error?: { code: number; message: string; data?: unknown }
+      }
+      if (msg.id === undefined && msg.method === ACP_SESSION_UPDATE) {
+        const p = msg.params as { update?: { content?: { text?: unknown } } } | undefined
+        const text = p?.update?.content?.text
+        if (typeof text === "string") lastUpdateText = text
+        return
+      }
+      if (typeof msg.id === "number" && pending.has(msg.id)) {
+        const entry = pending.get(msg.id)!
+        pending.delete(msg.id)
+        if (msg.error) {
+          entry.reject(Object.assign(new Error(msg.error.message), { code: msg.error.code, data: msg.error.data }))
+        } else {
+          entry.resolve(msg.result)
         }
       }
     })
@@ -234,16 +254,15 @@ export function daemonCall(
       const sessionId = sessNew?.sessionId
       if (!sessionId) { finish({ kind: "no-call" }); return }
 
-      // Defensive yield, measured on Bun 1.3.1: a `socket.write()` issued in
-      // the SAME synchronous tick as the data handler that just delivered
-      // session/new's response — immediately after a peer that destroyed
-      // itself right after flushing that response — neither throws, nor
-      // errors its callback, nor fires 'close'/'error' on this socket: it
-      // silently vanishes, and only the overall deadline timer would ever
-      // resolve the call. One macrotask tick here lets Bun's own close
-      // detection run first, so a truly-dead peer surfaces via the write
-      // callback (or a synchronous throw) immediately instead of stalling
-      // until budgetMs. Negligible cost against a live daemon.
+      // Defensive yield, carried over from the unix-socket transport
+      // (measured there: a `socket.write()` issued in the same synchronous
+      // tick as the data handler that just delivered session/new's
+      // response, immediately after a peer that destroyed itself right
+      // after flushing that response, could silently vanish with only the
+      // deadline timer left to resolve the call). Not independently
+      // re-measured for WebSocket's own internal buffering/close-detection
+      // ordering — kept as cheap, harmless insurance against an unverified
+      // but plausible analog, rather than assumed away.
       await new Promise<void>((res) => setTimeout(res, 0))
 
       const id = nextId++
@@ -257,13 +276,12 @@ export function daemonCall(
       }
       const respPromise = new Promise<unknown>((res, rej) => pending.set(id, { resolve: res, reject: rej }))
       try {
-        // §6e's client-side send boundary — the ONE write-callback
-        // assignment site. A write that errors before the callback cannot
-        // have delivered a parseable frame (a partial line sits in the
-        // daemon's FrameDecoder buffer and is never dispatched), so it is
-        // law L1, no-call.
-        await new Promise<void>((res, rej) =>
-          socket.write(encodeFrame(promptFrame), (err) => (err ? rej(err) : (sentPrompt = true, res()))))
+        // §6e's client-side send boundary — see this file's header comment
+        // for why `sentPrompt` is set right after a non-throwing `send()`
+        // rather than in a completion callback the global WebSocket API
+        // does not offer.
+        ws.send(JSON.stringify(promptFrame))
+        sentPrompt = true
       } catch (e) {
         pending.delete(id)
         throw e
@@ -290,44 +308,47 @@ export function daemonCall(
   })
 }
 
-/** A single connect + `initialize` probe. NEVER throws. Destroys the socket
- * and clears its timer before resolving, on every path. Returns true only
- * when a daemon answered with a MATCHING fingerprint. */
-function probeOnce(sock: string, fp: string, timeoutMs: number): Promise<boolean> {
+/** A single connect + `initialize` probe. NEVER throws. Closes the
+ * WebSocket and clears its timer before resolving, on every path. Returns
+ * true only when a daemon answered with a MATCHING fingerprint.
+ *
+ * Takes `env`, not a pre-resolved port — `readDiscovery(env)` is
+ * re-consulted on EVERY call, which matters for `pollUntil`'s retry loop:
+ * a daemon that publishes its discovery file slightly after polling began
+ * (or a stale entry a LATER starter's takeover has since replaced) must be
+ * picked up on the next attempt, not permanently missed because an earlier
+ * attempt cached a port that no longer means anything. */
+function probeOnce(env: Record<string, string | undefined>, fp: string, timeoutMs: number): Promise<boolean> {
   return new Promise((resolve) => {
+    const discovery = readDiscovery(env)
+    if (!discovery) { resolve(false); return }
     let settled = false
     let timer: ReturnType<typeof setTimeout> | undefined
-    // Construct-then-connect, listeners attached first (see daemonCall's
-    // matching comment: closes a `bun test`-only race where net.connect()'s
-    // 'error' can fire before a listener attached on the next line).
-    const socket = new net.Socket()
     const finish = (ok: boolean): void => {
       if (settled) return
       settled = true
       if (timer) { clearTimeout(timer); timer = undefined }
-      try { socket.destroy() } catch { /* ignore */ }
+      try { ws.close() } catch { /* ignore */ }
       resolve(ok)
     }
     timer = setTimeout(() => finish(false), timeoutMs)
-    socket.once("error", () => finish(false))
-    socket.setEncoding("utf8")
-    const decoder = new FrameDecoder()
-    socket.on("data", (chunk) => {
-      for (const f of decoder.push(chunk)) {
-        const msg = f as { id?: number; result?: AcpInitializeResult }
-        if (msg.id === 1 && msg.result) {
-          finish(msg.result._meta?.kkamak?.envFingerprint === fp)
-        }
-      }
-    })
-    socket.once("connect", () => {
+    const ws = new WebSocket(wsUrl(discovery.port))
+    ws.addEventListener("error", () => finish(false))
+    ws.addEventListener("open", () => {
       try {
-        socket.write(encodeFrame({ jsonrpc: "2.0", id: 1, method: ACP_INITIALIZE, params: { protocolVersion: 1 } }))
+        ws.send(JSON.stringify({ jsonrpc: "2.0", id: 1, method: ACP_INITIALIZE, params: { protocolVersion: 1 } }))
       } catch {
         finish(false)
       }
     })
-    socket.connect(sock)
+    ws.addEventListener("message", (ev: MessageEvent) => {
+      let f: unknown
+      try { f = JSON.parse(String(ev.data)) } catch { return }
+      const msg = f as { id?: number; result?: AcpInitializeResult }
+      if (msg.id === 1 && msg.result) {
+        finish(msg.result._meta?.kkamak?.envFingerprint === fp)
+      }
+    })
   })
 }
 
@@ -351,50 +372,48 @@ export function closeSession(
   opts?: { budgetMs?: number },
 ): Promise<{ closed: boolean; reason?: string }> {
   const budgetMs = opts?.budgetMs ?? PROBE_TIMEOUT_MS
-  const sock = socketPath(env)
 
   return new Promise((resolve) => {
+    const discovery = readDiscovery(env)
+    if (!discovery) { resolve({ closed: false, reason: "unreachable" }); return }
     let settled = false
     let timer: ReturnType<typeof setTimeout> | undefined
-    const socket = new net.Socket()
     const finish = (result: { closed: boolean; reason?: string }): void => {
       if (settled) return
       settled = true
       if (timer) { clearTimeout(timer); timer = undefined }
-      try { socket.destroy() } catch { /* ignore */ }
+      try { ws.close() } catch { /* ignore */ }
       resolve(result)
     }
     timer = setTimeout(() => finish({ closed: false, reason: "unreachable" }), budgetMs)
-    socket.once("error", () => finish({ closed: false, reason: "unreachable" }))
-    socket.setEncoding("utf8")
-    const decoder = new FrameDecoder()
-    socket.on("data", (chunk) => {
-      for (const f of decoder.push(chunk)) {
-        const msg = f as { id?: number; result?: { closed?: unknown; reason?: unknown } }
-        if (msg.id === 1 && msg.result) {
-          const closed = msg.result.closed === true
-          const reason = typeof msg.result.reason === "string" ? msg.result.reason : undefined
-          finish(reason === undefined ? { closed } : { closed, reason })
-        }
-      }
-    })
-    socket.once("connect", () => {
+    const ws = new WebSocket(wsUrl(discovery.port))
+    ws.addEventListener("error", () => finish({ closed: false, reason: "unreachable" }))
+    ws.addEventListener("open", () => {
       try {
-        socket.write(encodeFrame({ jsonrpc: "2.0", id: 1, method: ACP_SESSION_CLOSE, params: { sessionId } }))
+        ws.send(JSON.stringify({ jsonrpc: "2.0", id: 1, method: ACP_SESSION_CLOSE, params: { sessionId } }))
       } catch {
         finish({ closed: false, reason: "unreachable" })
       }
     })
-    socket.connect(sock)
+    ws.addEventListener("message", (ev: MessageEvent) => {
+      let f: unknown
+      try { f = JSON.parse(String(ev.data)) } catch { return }
+      const msg = f as { id?: number; result?: { closed?: unknown; reason?: unknown } }
+      if (msg.id === 1 && msg.result) {
+        const closed = msg.result.closed === true
+        const reason = typeof msg.result.reason === "string" ? msg.result.reason : undefined
+        finish(reason === undefined ? { closed } : { closed, reason })
+      }
+    })
   })
 }
 
-async function pollUntil(sock: string, fp: string, waitMs: number): Promise<boolean> {
+async function pollUntil(env: Record<string, string | undefined>, fp: string, waitMs: number): Promise<boolean> {
   const deadline = Date.now() + waitMs
   for (;;) {
     const remaining = deadline - Date.now()
     if (remaining <= 0) return false
-    if (await probeOnce(sock, fp, Math.max(50, Math.min(PROBE_TIMEOUT_MS, remaining)))) return true
+    if (await probeOnce(env, fp, Math.max(50, Math.min(PROBE_TIMEOUT_MS, remaining)))) return true
     if (Date.now() >= deadline) return false
     await new Promise((r) => setTimeout(r, Math.min(POLL_INTERVAL_MS, Math.max(0, deadline - Date.now()))))
   }
@@ -407,9 +426,9 @@ const DAEMON_ENTRY = path.join(import.meta.dir, "acp-daemon.ts")
 
 /** Spawn idiom (repo-established, hook-cli.ts:147-154), argv and env made
  * explicit (round-4 I2). `env` is the SAME object the caller fingerprinted
- * and derived socketPath() from — a daemon launched with a DIFFERENT env
- * computes a different envFingerprint AND binds a different socketPath, so
- * the client that just started it refuses it forever. */
+ * and derived discoveryPath() from — a daemon launched with a DIFFERENT env
+ * computes a different envFingerprint AND publishes a different discovery
+ * file, so the client that just started it refuses it forever. */
 function spawnDaemonProcess(env: Record<string, string | undefined>): void {
   const cmd = ["bun", DAEMON_ENTRY]
   const quoted = cmd.map((c) => `'${c.replace(/'/g, `'\\''`)}'`).join(" ")
@@ -424,34 +443,39 @@ function spawnDaemonProcess(env: Record<string, string | undefined>): void {
 /** Ensure a daemon is reachable. `waitMs` DEFAULTS TO 0 = kick and return
  * false immediately (the SessionStart hook's mode). Otherwise poll-connect
  * up to waitMs. Returns true when a daemon answered `initialize` with a
- * MATCHING fingerprint. NEVER throws — including when ensureSocketDir
- * raises EACCES on an unwritable parent. Destroys every socket it opens
+ * MATCHING fingerprint. NEVER throws — including when `acquireAcpLock`
+ * raises EACCES on an unwritable parent. Closes every WebSocket it opens
  * and clears every timer before resolving.
  *
  * `held` is tracked explicitly and NOTHING is released that was not
  * acquired — `releaseAcpLock` is an unlink; releasing a lock this caller
  * never held would delete the winner's lock and let the next caller spawn
- * a duplicate. */
+ * a duplicate.
+ *
+ * No `ensureSocketDir` equivalent here (the old socket-transport version
+ * called it before acquiring the spawn lock): `acquireAcpLock` ->
+ * `tryCreateLock` (acp-paths.ts) already creates the lock's own parent
+ * directory as part of the `wx`-create attempt — there was never a
+ * SEPARATE directory this file needed to prepare, only the daemon's own
+ * socket dir, which no longer exists as a concept. */
 export async function ensureDaemon(
   env: Record<string, string | undefined>,
   opts?: { waitMs?: number },
 ): Promise<boolean> {
   const waitMs = opts?.waitMs ?? 0
   try {
-    const sock = socketPath(env)
     const fp = envFingerprint(env)
 
     // 1. probe: a daemon may already be serving.
-    if (await probeOnce(sock, fp, PROBE_TIMEOUT_MS)) return true
+    if (await probeOnce(env, fp, PROBE_TIMEOUT_MS)) return true
 
     // 2. take the CLIENT spawn lock (distinct from the daemon's bind lock).
-    ensureSocketDir(sock)
     const lockPath = spawnLockPath(env)
     const held = acquireAcpLock(lockPath, Date.now())
 
     if (held) {
       // 3. re-probe: a winner may have finished between steps 1 and 2.
-      if (await probeOnce(sock, fp, PROBE_TIMEOUT_MS)) {
+      if (await probeOnce(env, fp, PROBE_TIMEOUT_MS)) {
         releaseAcpLock(lockPath)
         return true
       }
@@ -466,7 +490,7 @@ export async function ensureDaemon(
       return false
     }
     try {
-      return await pollUntil(sock, fp, waitMs)
+      return await pollUntil(env, fp, waitMs)
     } finally {
       if (held) releaseAcpLock(lockPath)
     }

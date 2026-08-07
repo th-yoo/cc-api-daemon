@@ -10,8 +10,9 @@
 //
 // THE ENV CONTRACT (round-4 I2): this process fingerprints and binds from
 // its OWN process.env — envFingerprint(process.env) is what `initialize`
-// echoes and socketPath(process.env) is what it listens on. Whoever spawns
-// it MUST pass, explicitly, the same env object it fingerprinted. The repo's
+// echoes and discoveryPath(process.env) is where it publishes {port, pid}
+// after binding. Whoever spawns it MUST pass, explicitly, the same env
+// object it fingerprinted. The repo's
 // established detached-spawn idiom (hook-cli.ts:147-154) passes no `env` and
 // inherits, which is correct only when the spawner fingerprinted
 // process.env itself. acp-client.ts's ensureDaemon (a later node) passes it
@@ -51,13 +52,30 @@
 // EVERY runtime side effect below is behind `import.meta.main`. acp-client
 // imports NOTHING from this file (see acp-paths.ts's own header for why the
 // path helpers live in a separate module the hook can safely import).
-import net from "node:net"
+//
+// websocket-transport swap: `runSocket`'s unix-domain-socket + FrameDecoder
+// framing is replaced by an `http.createServer()` + `WebSocketServer({
+// noServer:true})` pair, following chronos-api-0.4.5's src/index.ts:59-161
+// wiring (minus Koa — this package serves no HTTP routes, so `createServer()`
+// takes no request-handler argument at all; the only thing the bare HTTP
+// server exists for is `.on("upgrade", ...)`). `runStdio` is UNCHANGED and
+// keeps `FrameDecoder`/`encodeFrame` (imported from acp-wire.ts, which
+// keeps exporting them for exactly this) — stdin/stdout is a raw byte
+// stream with no message boundaries of its own, unlike a WebSocket
+// connection where each `message` event is already a discrete frame; the
+// websocket-transport plan is silent on `--stdio` (it has no unix-socket
+// analog to swap), so this is a deliberate scope note, not an oversight:
+// deleting the framing helpers outright (as the plan's Task 3 Step 2
+// literally says) would have broken a real, still-used entry point that
+// transport swap never touches.
+import http from "node:http"
 import fs from "node:fs"
 import crypto from "node:crypto"
+import { WebSocketServer, type WebSocket as WsConnection } from "ws"
 import type { TurnOutcome, DispatchableSession } from "./session-contract.ts"
 import { SessionPool, type WarmConstructOpts } from "./acp-pool.ts"
 import {
-  socketPath, ensureSocketDir, bindLockPath, envFingerprint, isPipe,
+  discoveryPath, writeDiscovery, readDiscovery, wsUrl, bindLockPath, envFingerprint,
   acquireAcpLock, releaseAcpLock,
 } from "./acp-paths.ts"
 import {
@@ -68,6 +86,7 @@ import {
   ACP_BUDGET,
   type WarmIsolation,
 } from "./acp-wire.ts"
+import { validateJsonRpc, createErrorResponse, JSON_RPC_PARSE_ERROR } from "./jsonrpc.ts"
 
 /** Production idle budget: 15 minutes. `KKAMAK_ACP_IDLE_MS` overrides for
  * tests (a few seconds) — acp-paths.ts's denylist note is explicit that
@@ -453,83 +472,85 @@ export function createDispatcher(pool: SessionPool, state: DaemonState, fingerpr
 // `parseTurnTimeoutMs`), so a `new SessionPool(env)` here is a complete
 // replacement, not an approximation.
 
-/** DEVIATION FROM THE PLAN TEXT, MEASURED (documented in the N3a report):
- * the brief's sequence is "listen → on EADDRINUSE, probe". Measured on this
- * runtime (Bun 1.3.1, node:net): `server.listen(path)` does NOT raise
- * EADDRINUSE when another live process already owns that Unix socket path
- * — it silently rebinds and steals the path out from under the first
- * listener (isolated repro: two `net.createServer().listen(sameSock)`
- * calls both report "listening", and new connections go to the SECOND —
- * the first is silently orphaned, never receiving another connection
- * again). Relying on EADDRINUSE here is therefore not a race-safety
- * problem, it is DEAD CODE: the signal this file's takeover logic is
- * supposed to react to never fires on this runtime, so a starter would
- * always "successfully" steal a live daemon's path.
- *
- * Fix: probe FIRST, always, before ever calling `listen`, and keep the
- * whole probe→(unlink)→listen sequence inside the caller's bind-lock
- * critical section exactly as the plan requires — the lock (a `wx`-created
- * file, unrelated to net.Server and unaffected by this quirk) is what
- * actually serializes two starters; the EADDRINUSE branch was only ever an
- * optimization to skip the probe on the uncontended path, and skipping it
- * is unconditionally safe, just marginally slower. An EADDRINUSE handler
- * is kept as a defensive fallback in case this Bun behavior changes. */
-function bindWithTakeover(server: net.Server, sock: string): Promise<"bound" | "already-live"> {
-  return new Promise((resolve, reject) => {
-    const probe = net.connect(sock)
+/** websocket-transport swap: replaces the unix-socket `bindWithTakeover`.
+ * "Is a daemon already live for this env" is no longer answerable by
+ * connecting to a fixed path — it now means "does `readDiscovery(env)`
+ * point at a port that answers a WebSocket handshake". A stale discovery
+ * file pointing at a DEAD port and one pointing at a REUSED port (a
+ * different, unrelated process now bound to that port number by the OS)
+ * are new failure modes the socket path never had — both collapse to the
+ * same `false` here: the probe either upgrades to a WebSocket (live, ours
+ * or not — see below) or it doesn't. A REUSED port answering some
+ * unrelated non-WebSocket service fails the handshake exactly like a dead
+ * port does, so it correctly falls through to takeover; only a port reused
+ * by some OTHER live WebSocket server would be mistaken for "already
+ * live" here, the same low-probability residual risk the old unix-socket
+ * probe had for a reused path. */
+function probePort(port: number, timeoutMs = 2_000): Promise<boolean> {
+  return new Promise((resolve) => {
     let settled = false
-    const settle = (live: boolean) => {
+    const settle = (live: boolean): void => {
       if (settled) return
       settled = true
       clearTimeout(timer)
-      probe.removeAllListeners()
-      try { probe.destroy() } catch { /* ignore */ }
-      if (live) { resolve("already-live"); return }
-      // ECONNREFUSED / ENOENT / any other probe failure: the path is
-      // stale or absent. Unlink (ENOENT-tolerant) and make ONE listen
-      // attempt.
-      try {
-        fs.unlinkSync(sock)
-      } catch (e) {
-        if ((e as NodeJS.ErrnoException)?.code !== "ENOENT") { reject(e); return }
-      }
-      server.once("error", (err: NodeJS.ErrnoException) => {
-        // Defensive fallback: if EADDRINUSE ever DOES fire (e.g. a future
-        // Bun version fixes this), treat it the same as a live probe
-        // rather than crashing.
-        if (err.code === "EADDRINUSE") { resolve("already-live"); return }
-        reject(err)
-      })
-      server.listen(sock, () => resolve("bound"))
+      try { ws.close() } catch { /* ignore */ }
+      resolve(live)
     }
-    // A hung probe on an orphaned path is functionally "not live" — do not
-    // let it block the takeover forever.
-    const timer = setTimeout(() => settle(false), 2_000)
-    probe.once("connect", () => settle(true))
-    probe.once("error", () => settle(false))
+    const timer = setTimeout(() => settle(false), timeoutMs)
+    // The GLOBAL, browser-standard WebSocket (Bun/Node both implement it
+    // natively) — deliberately not `ws`'s own client class, so this
+    // self-probe exercises the exact same constructor Task 4's real client
+    // (acp-client.ts) uses, per the plan's own `new WebSocket(url)`.
+    let ws: WebSocket
+    try {
+      ws = new WebSocket(wsUrl(port))
+    } catch {
+      clearTimeout(timer)
+      resolve(false)
+      return
+    }
+    ws.onopen = () => settle(true)
+    ws.onerror = () => settle(false)
   })
 }
 
-async function runSocket(
+/** Race-free the same way the old unix-socket takeover was: the WHOLE
+ * probe→bind sequence runs while holding the bind lock. Losing the lock
+ * race is a refusal, never an assumed ownership — another starter is
+ * either actively mid-bind (will finish the job) or, if its lock is
+ * stale, will be taken over by the NEXT starter's `acquireAcpLock` call. */
+async function bindWithTakeover(
+  server: http.Server,
+  env: Record<string, string | undefined>,
+): Promise<{ outcome: "already-live" } | { outcome: "bound"; port: number }> {
+  const existing = readDiscovery(env)
+  if (existing && (await probePort(existing.port))) {
+    return { outcome: "already-live" }
+  }
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject)
+    server.listen(0, "127.0.0.1", () => resolve())
+  })
+  const address = server.address()
+  if (address === null || typeof address === "string") {
+    throw new Error("server.address() returned no port after listen")
+  }
+  return { outcome: "bound", port: address.port }
+}
+
+async function runServer(
   env: Record<string, string | undefined>,
   opts?: { makeSession?: (env: Record<string, string | undefined>, warmOpts: WarmConstructOpts) => DispatchableSession },
 ): Promise<void> {
-  const sock = socketPath(env)
   const bindLock = bindLockPath(env)
   const fingerprint = envFingerprint(env)
   const idleMs = Number(env.KKAMAK_ACP_IDLE_MS) || DEFAULT_IDLE_MS
 
-  // MAY throw (EACCES on an unwritable parent) — a daemon that cannot even
-  // create its own socket directory has nothing safe left to do. The
-  // client's ensureDaemon (a later node) owns the fail-open wrapping around
+  // Stale-discovery takeover, race-free: the WHOLE probe→bind sequence
+  // below runs while holding the bind lock. MAY throw (EACCES on an
+  // unwritable parent) — same fail-open contract as before: the client's
+  // ensureDaemon (a later node) owns the fail-open wrapping around
   // SPAWNING this file, not this file itself.
-  ensureSocketDir(sock)
-
-  // Stale-socket takeover, race-free: the WHOLE probe→unlink→rebind
-  // sequence below runs while holding the bind lock. Losing the lock race
-  // is a refusal, never an assumed ownership — another starter is either
-  // actively mid-bind (will finish the job) or, if its lock is stale, will
-  // be taken over by the NEXT starter's acquireAcpLock call.
   if (!acquireAcpLock(bindLock, Date.now())) {
     process.exit(0)
     return
@@ -539,7 +560,7 @@ async function runSocket(
   const pool = new SessionPool(env, opts?.makeSession ? { makeSession: opts.makeSession } : {})
   const state = createDaemonState()
   const dispatch = createDispatcher(pool, state, fingerprint)
-  const sockets = new Set<net.Socket>()
+  const clients = new Set<WsConnection>()
   // Daemon-level activity clock (N3c-iii): the single WarmSession's own
   // `idleMs()` gate no longer exists — a pool can hold several entries, each
   // with its own idle clock the pool's own `reap()` already owns. Self-exit
@@ -548,49 +569,76 @@ async function runSocket(
   // of which connection or session it belongs to.
   let lastActivityAt = Date.now()
 
-  const server = net.createServer((socket) => {
-    sockets.add(socket)
-    // Second layer on FrameDecoder's own UTF-8-boundary safety (its
-    // header comment explains why both exist).
-    socket.setEncoding("utf8")
-    const decoder = new FrameDecoder()
-    const write: Write = (msg) => {
-      try { socket.write(encodeFrame(msg)) } catch { /* peer gone */ }
-    }
-    socket.on("data", (chunk) => {
-      for (const f of decoder.push(chunk)) {
-        lastActivityAt = Date.now()
-        void dispatch(f, write)
-      }
-    })
-    socket.on("close", () => { sockets.delete(socket) })
-    socket.on("error", () => { /* a peer reset must never crash the daemon */ })
+  const wss = new WebSocketServer({ noServer: true })
+  const server = http.createServer()   // no Koa — this package serves no HTTP routes
+
+  server.on("upgrade", (req, socket, head) => {
+    // RULING 2026-08-07 (user, recorded verbatim in the websocket-transport
+    // plan's own RULING section): no Origin check, no token — every
+    // upgrade is accepted. The unix socket got authorization from the
+    // filesystem (0700 dir) for free; TCP has no equivalent, and the
+    // ruling declines to re-create one. See CLAUDE.md's Security section.
+    wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req))
   })
 
-  let outcome: "bound" | "already-live"
+  wss.on("connection", (ws: WsConnection) => {
+    clients.add(ws)
+    // ONE write closure per connection — the same per-connection response
+    // routing the unix socket had via its own per-socket `write`. This is
+    // what makes (connection, id) sufficient to correlate responses; it is
+    // not new behaviour.
+    const write: Write = (msg) => {
+      try { ws.send(JSON.stringify(msg)) } catch { /* peer gone */ }
+    }
+    ws.on("message", (data) => {
+      lastActivityAt = Date.now()
+      let parsed: unknown
+      try {
+        parsed = JSON.parse(String(data))
+      } catch {
+        write(createErrorResponse(null, JSON_RPC_PARSE_ERROR, "Parse error"))
+        return
+      }
+      const v = validateJsonRpc(parsed)
+      if (!v.ok) {
+        // Per JSON-RPC 2.0 (jsonrpc.ts's own rule, ported from chronos): a
+        // notification never gets a reply, even a malformed one.
+        if (v.isNotification) return
+        write(createErrorResponse(v.id, v.code, v.message))
+        return
+      }
+      void dispatch(v.value, write)
+    })
+    ws.on("close", () => { clients.delete(ws) })
+    ws.on("error", () => { /* a peer reset must never crash the daemon */ })
+  })
+
+  let bindOutcome: { outcome: "already-live" } | { outcome: "bound"; port: number }
   try {
-    outcome = await bindWithTakeover(server, sock)
+    bindOutcome = await bindWithTakeover(server, env)
   } catch (e) {
     releaseAcpLock(bindLock)
     throw e
   }
-  if (outcome === "already-live") {
+  if (bindOutcome.outcome === "already-live") {
     releaseAcpLock(bindLock)
     process.exit(0)
     return
   }
 
-  // Filesystem hygiene is Unix-only — named pipes carry no file mode.
-  if (!isPipe(sock)) {
-    try { fs.chmodSync(sock, 0o600) } catch { /* best-effort */ }
-  }
-  // Released immediately after a successful listen (+ chmod): the lock
-  // only needs to cover the racy probe→unlink→rebind window, not the
-  // daemon's whole lifetime.
+  // Publish AFTER a successful bind, never at boot — a discovery file
+  // means "someone IS listening here", not "someone is about to". 0600 /
+  // dir 0700 (writeDiscovery's own doc comment) — the RULING declines to
+  // authenticate the WebSocket handshake, but there is no reason to make
+  // the port world-readable when the socket dir never was.
+  writeDiscovery(env, { port: bindOutcome.port, pid: process.pid })
+  // Released immediately after a successful listen (+ publish): the lock
+  // only needs to cover the racy probe→bind window, not the daemon's whole
+  // lifetime.
   releaseAcpLock(bindLock)
 
   // Test seam: exactly one line here means exactly one daemon is serving.
-  // Written AFTER listen+chmod succeed — never at boot — so a starter that
+  // Written AFTER bind+publish succeed — never at boot — so a starter that
   // lost the bind race (exited above) writes nothing.
   if (env.KKAMAK_ACP_TEST_SPAWN_LOG) {
     try {
@@ -598,9 +646,9 @@ async function runSocket(
     } catch { /* best-effort */ }
   }
 
-  // Post-bind runtime errors (e.g. EMFILE on accept) must never crash the
-  // process — the daemon dying on a transient error is a fail-open
-  // violation just as much as dying on a bad frame.
+  // Post-bind runtime errors must never crash the process — the daemon
+  // dying on a transient error is a fail-open violation just as much as
+  // dying on a bad frame.
   server.on("error", () => { /* ignore */ })
 
   let reaper: ReturnType<typeof setInterval> | undefined
@@ -610,45 +658,44 @@ async function runSocket(
     shuttingDown = true
     if (reaper) clearInterval(reaper)
     // Stop accepting new connections FIRST, then close what is open, then
-    // tear down the session, then RE-ACQUIRE the bind lock before
-    // unlinking, then release it, then exit. Unlinking before draining
-    // races a client that has already written a session/prompt; a client
-    // torn down between session/new and session/prompt instead sees its
-    // socket close before the prompt frame was written — law L1, no-call,
-    // safe to fall back.
+    // tear down the session, then RE-ACQUIRE the bind lock before deleting
+    // the discovery file, then release it, then exit. Deleting before
+    // draining races a client that has already sent a session/prompt
+    // message; a client torn down between session/new and session/prompt
+    // instead sees its connection close before the prompt frame was sent —
+    // law L1, no-call, safe to fall back.
     //
-    // Round-2 review finding 4 (2026-08-05, user ruling): the naive
-    // "release lock (already done at listen-time), then unlink" order is
-    // internally inconsistent with this Bun runtime's takeover design
-    // (bindWithTakeover, above) — a starter that wins the bind-lock race
-    // while THIS daemon is draining has its OWN, brand-new, LIVE socket
-    // already bound by the time it releases the lock; this daemon must not
-    // unlink out from under it. Re-acquiring the SAME lock here makes this
-    // daemon's shutdown-unlink just another lock-holder, serialized against
-    // every starter exactly like bindWithTakeover's probe→unlink→rebind is.
-    // Best-effort: if another starter currently holds a FRESH lock, it is
-    // mid-bind — skip the unlink entirely; that starter's own probe (which
-    // will now correctly see this daemon as dead) or a later starter's
-    // takeover handles the stale path.
+    // Round-2 review finding 4 (2026-08-05, user ruling, carried over from
+    // the unix-socket design): the naive "release lock (already done at
+    // listen-time), then delete" order is internally inconsistent with
+    // this file's takeover design (bindWithTakeover, above) — a starter
+    // that wins the bind-lock race while THIS daemon is draining has its
+    // OWN, brand-new, LIVE discovery entry already published by the time
+    // it releases the lock; this daemon must not delete out from under it.
+    // Re-acquiring the SAME lock here makes this daemon's shutdown-delete
+    // just another lock-holder, serialized against every starter exactly
+    // like bindWithTakeover's probe→bind is. Best-effort: if another
+    // starter currently holds a FRESH lock, it is mid-bind — skip the
+    // delete entirely; that starter's own probe (which will now correctly
+    // see this daemon as dead) or a later starter's takeover handles the
+    // stale entry.
     server.close()
-    for (const s of sockets) { try { s.destroy() } catch { /* ignore */ } }
+    for (const ws of clients) { try { ws.terminate() } catch { /* ignore */ } }
     pool.closeAll()
     // Review finding: `acquireAcpLock` is not "never throws" — a rethrown
     // non-EEXIST error (e.g. EACCES on the lock dir) must not skip
     // `process.exit` below and become an unhandled rejection. Wrapping the
-    // whole acquire+unlink+release block preserves the exact semantics:
-    // lock acquired -> unlink -> release; acquisition failed (false, no
-    // throw) -> skip unlink (unchanged, the `if` is simply not entered);
-    // acquisition throws -> caught here, also skip unlink, shutdown still
+    // whole acquire+delete+release block preserves the exact semantics:
+    // lock acquired -> delete -> release; acquisition failed (false, no
+    // throw) -> skip delete (unchanged, the `if` is simply not entered);
+    // acquisition throws -> caught here, also skip delete, shutdown still
     // proceeds to exit.
-    if (!isPipe(sock)) {
-      try {
-        if (acquireAcpLock(bindLock, Date.now())) {
-          try { fs.unlinkSync(sock) } catch { /* ignore */ }
-          releaseAcpLock(bindLock)
-        }
-      } catch { /* ignore — shutdown must still reach process.exit below */ }
-    }
+    try {
+      if (acquireAcpLock(bindLock, Date.now())) {
+        try { fs.rmSync(discoveryPath(env), { force: true }) } catch { /* ignore */ }
+        releaseAcpLock(bindLock)
+      }
+    } catch { /* ignore — shutdown must still reach process.exit below */ }
     process.exit(code)
   }
 
@@ -698,7 +745,7 @@ async function runStdio(
 
 if (import.meta.main) {
   const env = process.env as Record<string, string | undefined>
-  const run = process.argv.includes("--stdio") ? runStdio(env) : runSocket(env)
+  const run = process.argv.includes("--stdio") ? runStdio(env) : runServer(env)
   run.catch((e) => {
     console.error(e)
     process.exit(1)
