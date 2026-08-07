@@ -81,4 +81,70 @@ export class ApiSession {
     this.pending = []
     this.history = []
   }
+
+  oneShot(messageText: string, model: string, opts: { recycle: boolean; tag?: string }): Promise<TurnOutcome> {
+    return new Promise<TurnOutcome>((resolve) => {
+      if (this.closed) { resolve({ kind: "no-call" }); return }
+      if (opts.recycle) this.history = []
+      let settled = false
+      const turn: PendingTurn = {
+        text: messageText, model, tag: opts.tag, sent: false, dropped: false,
+        controller: undefined,
+        settle: (o) => { if (!settled) { settled = true; resolve(o) } },
+      }
+      // The queue-wait timer arms at the PUSH, matching upstream: a turn
+      // still queued when it fires provably never reached the wire.
+      const queueTimer = setTimeout(() => {
+        if (!turn.sent && this.current !== turn) {
+          turn.dropped = true
+          this.pending = this.pending.filter((t) => t !== turn)
+          turn.settle({ kind: "no-call" })
+        }
+      }, this.queueWaitMs)
+      const settleOnce = turn.settle
+      turn.settle = (o) => { clearTimeout(queueTimer); settleOnce(o) }
+      this.pending.push(turn)
+      void this.drain()
+    })
+  }
+
+  /** Strict FIFO, one turn on the wire at a time. Never throws — a rejection
+   * escaping here would surface as an unhandled rejection in the daemon
+   * process, killing the host-global singleton. */
+  private async drain(): Promise<void> {
+    if (this.draining) return
+    this.draining = true
+    try {
+      while (this.pending.length > 0 && !this.closed) {
+        const turn = this.pending.shift()!
+        if (turn.dropped) continue
+        this.current = turn
+        const controller = new AbortController()
+        turn.controller = controller
+        const deadline = setTimeout(() => controller.abort(), this.turnTimeoutMs)
+        // THE SEND BOUNDARY. Everything after this point is call-consumed.
+        turn.sent = true
+        const messages = [...this.history, { role: "user" as const, content: turn.text }]
+        const outcome = await sendOne(turn.text, turn.model, this.env, {
+          isolation: this.isolation,
+          budgetMs: this.turnTimeoutMs,
+          authDeps: this.authDeps,
+          signal: controller.signal,
+          messages,
+        })
+        clearTimeout(deadline)
+        // History advances ONLY on a proven-ok turn: a failed or aborted turn
+        // must not leave a dangling user message that every later turn
+        // re-sends and re-pays for.
+        if (outcome.kind === "ok") {
+          this.history = [...messages, { role: "assistant", content: outcome.text }]
+        }
+        this.current = undefined
+        turn.settle(outcome)
+      }
+    } finally {
+      this.draining = false
+      this.current = undefined
+    }
+  }
 }
