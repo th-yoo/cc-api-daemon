@@ -94,6 +94,24 @@ below exists to make that structurally hard, not just discouraged.
    someone reads the actual failure. If a test genuinely needs live
    credentials (nothing in this package currently does), it needs its own
    clearly-named opt-in, not a silent skip.
+
+   **Not the same thing, worth telling apart**: `KKAMAK_GATE_FAST=1`
+   (Task 7) `describe.skipIf`s the real-`claude`-CLI-subprocess-spawning
+   blocks (`test/warm-session.test.ts`'s "spawns bundled CLI" and "a custom
+   isolation reaches the wire", `test/acp-daemon.test.ts`'s "reaches the
+   stubbed model" — each pays a measured 1.25–1.46s CLI spawn, some paths
+   twice) to keep the gate's gate.json `check` fast. This is NOT rule 4's
+   pattern: it depends on no ambient host state (a checked-in env var, not
+   "does this machine happen to have a credential file"), it is visible in
+   `gate.json` and reported as a skip count in bun:test's own output, and
+   the full suite still runs unconditionally everywhere else — `bun test`
+   bare, and both CI steps in `.github/workflows/ci.yml`, which the flag
+   never touches. The credential-precedence guard test (Task 6, "locks the
+   credential-precedence claim...") is deliberately carved out of the
+   skipped set even under the fast flag — see its own describe block in
+   `warm-session.test.ts` for why. `GATE_FAST` (`test/helpers.ts`) is the
+   one place the env var is read; every file importing it shares the same
+   decision instead of re-testing `process.env` and risking drift.
 5. **Existing protections worth preserving, not weakening**: `envFingerprint`
    (`acp-paths.ts`) redacts any env key matching `ACP_SECRET_KEY_RE =
    /(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)/i` to `KEY=set` before hashing —

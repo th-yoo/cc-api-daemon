@@ -20,6 +20,7 @@ import { WarmSession, selectEvidence } from "../src/warm-session.ts"
 import { modelProvenBy, CLI_SPAWN_BUDGET_MS, GAUGE_ISOLATION } from "../src/acp-wire.ts"
 import { sseText, hangFirstServer, until, warmHermeticEnv } from "./agent-cli-stub.ts"
 import { stubServer } from "./sdk-stub.ts"
+import { GATE_FAST } from "./helpers.ts"
 
 // With turnTimeoutMs floored at CLI_SPAWN_BUDGET_MS (8s), a hard-reset
 // test's worst case is ~8s + hardGrace + a full respawn + a second turn —
@@ -82,7 +83,13 @@ describe("selectEvidence (§6e model-evidence selection, pure -- no CLI, no stub
   })
 })
 
-describe("WarmSession (spawns bundled CLI, hermetic — fake ANTHROPIC_API_KEY, local stub)", () => {
+// Task 7 (gate-split): SLOW lane — each test here pays a real `claude` CLI
+// subprocess spawn (measured 1.25-1.46s, some paths twice on
+// respawn/hard-reset). Skipped under KKAMAK_GATE_FAST=1 (gate.json's own
+// `check`); a bare `bun test` (default, everywhere else) always runs it.
+// The credential-precedence guard is deliberately NOT in this block — see
+// its own describe below, which is exempt on purpose.
+describe.skipIf(GATE_FAST)("WarmSession (spawns bundled CLI, hermetic — fake ANTHROPIC_API_KEY, local stub)", () => {
   test("two records reuse one subprocess; the second context is clean; exactly one call each", async () => {
     let n = 0
     const CAPTURED: Array<Record<string, unknown>> = []
@@ -297,7 +304,20 @@ describe("WarmSession (spawns bundled CLI, hermetic — fake ANTHROPIC_API_KEY, 
     expect(ws.turnInFlight()).toBe(false)
     cap.stop()
   }, CLI_TEST_TIMEOUT_MS)
+})
 
+// Task 7 CARVE-OUT — NOT a "safe to bundle into the slow lane" block. This
+// describe is deliberately SEPARATE from "WarmSession (spawns bundled
+// CLI...)" above and MUST NEVER be wrapped in `describe.skipIf(GATE_FAST)`
+// or folded back into that block. It is the one test in this file that
+// catches a silent CLI credential-precedence flip (Task 6) — if a future
+// `claude` release ever started honoring on-disk/keychain credentials over
+// an explicit ANTHROPIC_API_KEY, every OTHER hermetic test here would keep
+// passing (the local stub accepts any credential) with no alarm. A gate
+// that stops running this one test on every Stop is a gate that stops
+// guarding the thing most worth guarding in a PUBLIC repo. Measured cost:
+// ~1s — the fast lane pays it deliberately.
+describe("CLI credential-precedence guard (Task 6/7 — ALWAYS runs, never gated by KKAMAK_GATE_FAST)", () => {
   test("warmHermeticEnv makes the spawned CLI present the fake key, never a bearer token — locks the credential-precedence claim this whole hermetic test file rests on", async () => {
     // Load-bearing regression lock (Task 6): this file's own header claims
     // the spawned CLI honors an explicit ANTHROPIC_API_KEY over on-disk/
@@ -350,7 +370,9 @@ describe("WarmSession isolation option (construction only, no CLI spawn)", () =>
   })
 })
 
-describe("a custom isolation reaches the wire", () => {
+// Task 7 (gate-split): SLOW lane — real CLI subprocess spawn. See the block
+// comment above the "spawns bundled CLI" describe for the full rationale.
+describe.skipIf(GATE_FAST)("a custom isolation reaches the wire", () => {
   test("a non-empty systemPrompt is what the request carries", async () => {
     const CAPTURED: Array<Record<string, unknown>> = []
     const cap = stubServer((c) => { CAPTURED.push(c.body); return sseText("ANSWER", STUB_DECLARED_MODEL) })

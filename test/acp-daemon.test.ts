@@ -16,6 +16,7 @@ import path from "node:path"
 import { tmpdir } from "node:os"
 import { sseText, until } from "./agent-cli-stub.ts"
 import { stubServer } from "./sdk-stub.ts"
+import { GATE_FAST } from "./helpers.ts"
 
 /** Plain JSON, not sseText(): api-session.ts's sendOne calls the real
  * @anthropic-ai/sdk's messages.create WITHOUT stream:true (non-streaming
@@ -1206,7 +1207,13 @@ describe("acp-daemon dispatcher — session/close", () => {
 // HAS_CLAUDE_CODE_CREDENTIALS: that credential requirement belonged to the
 // old agent-SDK-CLI transport, not this backend (see acp-client.test.ts's
 // own re-enable note for the full reasoning).
-describe("acp-daemon over unix socket (reaches the stubbed model)", () => {
+//
+// Task 7 (gate-split): SessionPool's default backend is WarmSession since
+// this repo's own Task 5, so most of this block's daemon spawns ALSO spawn
+// a real `claude` CLI subprocess underneath (AGENT_TEST_MODEL turns) —
+// SLOW lane, skipped under KKAMAK_GATE_FAST=1 (gate.json's own `check`); a
+// bare `bun test` always runs it.
+describe.skipIf(GATE_FAST)("acp-daemon over unix socket (reaches the stubbed model)", () => {
   test("initialize -> session/new -> session/prompt round-trip, fingerprint and PROVEN-model evidence echoed", async () => {
     const e = tempEndpoint("rt"); LIVE.push(e)
     const cap = stubServer(() => okBody("ANSWER", STUB_DECLARED_MODEL))
