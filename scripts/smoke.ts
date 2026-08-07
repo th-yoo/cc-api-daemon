@@ -1,12 +1,19 @@
 // Live smoke — REAL SPEND (one haiku call). Run deliberately, never in CI:
 //   bun scripts/smoke.ts
-// Task 5 of the api-sdk-swap plan: index.ts now points at the real ACP
-// client (acp-client.ts), not the old in-process credential-resolve-and-call.
-// ensureDaemon connects-or-spawns a real daemon over a unix socket;
-// daemonCall is a real round-trip through it. Same real auth ladder (on a
-// dev machine typically the darwin keychain OAuth lane) — it's just
-// resolved daemon-side (ApiSession) now, not in this process — one
-// messages.create, and the provenance check.
+// index.ts points at the real ACP client (acp-client.ts): ensureDaemon
+// connects-or-spawns a real daemon over a unix socket; daemonCall is a real
+// round-trip through it. Auth is resolved daemon-side (ApiSession) now, not
+// in this process — one messages.create, and the provenance check.
+//
+// Task 7 reality-check: ensureDaemon(env) alone defaults to waitMs:0 (kick
+// a background spawn, return immediately — the SessionStart-hook mode),
+// which on a cold run (nothing already listening) returns false before the
+// spawned daemon has had any chance to bind. That is NOT a credentials
+// failure — ensureDaemon only proves socket connectivity + envFingerprint
+// match; auth resolution happens later, inside the daemon, per turn.
+// waitMs:15_000 gives a freshly-spawned `bun src/acp-daemon.ts` process
+// enough time to bind (Task 6's e2e test measured well under that on a
+// warm Bun install).
 import { ensureDaemon, daemonCall, modelProvenBy, type WarmIsolation } from "../src/index.ts"
 
 const REQUESTED = "claude-haiku-4-5"
@@ -24,10 +31,10 @@ const isolation: WarmIsolation = {
 
 const env = process.env as Record<string, string | undefined>
 
-const ready = await ensureDaemon(env)
+const ready = await ensureDaemon(env, { waitMs: 15_000 })
 console.log("ensureDaemon:", ready)
 if (!ready) {
-  console.error("no resolvable credentials — smoke cannot run")
+  console.error("daemon did not come up within 15s (spawn failed or never bound) — smoke cannot run")
   process.exit(1)
 }
 

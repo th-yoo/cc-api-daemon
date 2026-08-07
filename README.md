@@ -1,13 +1,17 @@
 # @th-yoo/cc-api-daemon
 
-Single-process `@anthropic-ai/sdk` twin of the kkamak ACP warm-lane client
-surface. Same six exports as the original out-of-process ACP daemon
-(`ensureDaemon`, `daemonCall`, `closeSession`, `DaemonOutcome`,
-`WarmIsolation`, `modelProvenBy`) and the same outcome semantics — but each
-`daemonCall` is exactly one Messages API call. No daemon process, no socket,
-no subprocess. Two more exports, `listModels`/`retrieveModel`, cover
-read-only model metadata with a *separate*, non-spend outcome vocabulary —
-see "Model metadata" below.
+An ACP (Agent Client Protocol) daemon — unix socket, newline-delimited
+JSON-RPC, a session pool — with `@anthropic-ai/sdk`'s `messages.create` as
+the backend instead of a spawned Claude Code CLI subprocess. Same wire
+protocol, socket, pool, and outcome semantics as meta-harness's
+`cc-gate-plugin/src/acp`; every turn is exactly one `messages.create` call.
+
+`ensureDaemon`/`daemonCall`/`closeSession` are the client trio: connect to a
+running daemon, or spawn one, over a real unix socket. `ApiSession` is the
+injectable backend the daemon runs by default (see "Swapping the backend"
+below). `listModels`/`retrieveModel` wrap the Anthropic Models API — a
+capability the ACP wire itself has no method for; see "Model metadata"
+below.
 
 ## Install
 
@@ -24,7 +28,9 @@ exports.
 
 ```ts
 import {
+  ensureDaemon,
   daemonCall,
+  closeSession,
   modelProvenBy,
   type WarmIsolation,
 } from "@th-yoo/cc-api-daemon"
@@ -41,6 +47,12 @@ const isolation: WarmIsolation = {
   thinking: { type: "disabled" },
 }
 
+// Connect to a daemon already listening on this env's socket, or spawn one
+// and wait up to waitMs for it to bind. waitMs defaults to 0 (kick a
+// background spawn, return immediately) — pass a real budget when the
+// caller needs the daemon up before proceeding, e.g. a cold-start script.
+await ensureDaemon(process.env, { waitMs: 10_000 })
+
 const requested = "claude-haiku-4-5"
 const outcome = await daemonCall("Say ok.", requested, process.env, { isolation })
 
@@ -50,6 +62,7 @@ switch (outcome.kind) {
       throw new Error(`served by ${outcome.model}, not ${requested}`)
     }
     console.log(outcome.text)
+    await closeSession(outcome.sessionId!, process.env)
     break
   case "no-call":
     // Provably nothing was sent — safe to fall back to another lane.
@@ -60,6 +73,26 @@ switch (outcome.kind) {
 }
 ```
 
+`daemonCall` does not spawn a daemon itself — it only connects to whatever
+`socketPath(env)` resolves to. Call `ensureDaemon` first (as above) unless
+something else in the process already has.
+
+### Running the daemon directly
+
+`ensureDaemon`'s connect-or-spawn is the only path exercised in this
+package's own tests and is the intended way to bring a daemon up. A host
+that wants to pre-launch one explicitly (rather than let the first
+`ensureDaemon` call spawn it) can still run the entry point directly:
+
+```sh
+bun src/acp-daemon.ts          # unix socket transport (default)
+bun src/acp-daemon.ts --stdio  # stdio transport
+```
+
+There is no `serveDaemon`-style importable function — every runtime side
+effect in `acp-daemon.ts` lives behind `if (import.meta.main)`, so the
+daemon is a script, not a library call.
+
 ## Auth
 
 Credential precedence, first hit wins:
@@ -69,20 +102,44 @@ Credential precedence, first hit wins:
 3. darwin: macOS keychain item `Claude Code-credentials`
 4. else: `~/.claude/.credentials.json`
 
-The `env` PARAM you pass to `daemonCall`/`ensureDaemon` is the authority —
-not the real `process.env` (see Known limitations for the SDK-side
-exceptions). The OAuth lane sends `anthropic-beta: oauth-2025-04-20` with
-`apiKey` explicitly suppressed; the apiKey lane suppresses `authToken`.
+Resolved **daemon-side** now (inside `ApiSession`, per turn), not by the
+client process that calls `daemonCall`. The env that matters is whichever
+one first spawned the daemon: `Bun.spawn`'s `env` option *replaces* the
+child process's environment rather than merging with the caller's, so the
+daemon subprocess runs with exactly the env object passed to the
+`ensureDaemon` call that spawned it, for its whole lifetime (until idle
+reaped). A daemon spawned with a different env computes a different
+`envFingerprint` and binds a different socket path, so a client with a
+mismatched env simply never reaches it (`no-call`) rather than reaching it
+under the wrong credentials.
+
+The OAuth lane sends `anthropic-beta: oauth-2025-04-20` with `apiKey`
+explicitly suppressed; the apiKey lane suppresses `authToken`.
+
+## Swapping the backend
+
+`ApiSession` is the default session the daemon's pool constructs, but it is
+injectable — `acp-daemon.ts`'s `runSocket`/`runStdio` (and the lower-level
+`createDaemonState`) both accept a `makeSession` option shaped
+`(env, warmOpts) => DispatchableSession`. A host embedding this daemon can
+supply its own backend (a different model provider, a scripted fake for
+tests) without touching the wire layer; `session-contract.ts`'s
+`DispatchableSession` is the contract both implementations are checked
+against.
 
 ## Outcome law
 
-- `no-call` — provably nothing went toward the model: thinking-enabled
-  refusal, no resolvable auth, a throw before the request is entered. Safe to
+- `no-call` — provably nothing went toward the model: no socket reachable,
+  connect refused, `initialize`/`session/new` failure, envFingerprint
+  mismatch, a write error, or (daemon-side) a thinking-enabled refusal / no
+  resolvable auth / a throw before `messages.create` is entered. Safe to
   fall back elsewhere.
-- `call-consumed` — any ambiguity at or after `messages.create`: HTTP error,
-  timeout, empty content. A call may have been spent; the caller must NOT
-  double-spend.
-- `maxRetries: 0` — exactly one HTTP call ever per `daemonCall`.
+- `call-consumed` — any ambiguity at or after the `session/prompt` frame's
+  write callback reports success: HTTP error (including 401), timeout,
+  socket close/error, budget expiry with no response, empty content. A call
+  may have been spent; the caller must NOT double-spend.
+- `maxRetries: 0` on the daemon's own SDK client — exactly one HTTP call
+  ever per turn.
 
 This vocabulary is specific to `daemonCall`'s billed `messages.create` send —
 see "Model metadata" below for the separate, unbilled-GET outcome vocabulary
@@ -92,9 +149,10 @@ used by `listModels`/`retrieveModel`.
 
 `listModels`/`retrieveModel` wrap the Anthropic Models API
 (`GET /v1/models`, `GET /v1/models/{id}`) — read-only, idempotent GETs, not
-billed model turns. Unlike `daemonCall`, there is no no-call/call-consumed
-double-spend concern here, so the outcome vocabulary names what actually
-happened instead:
+billed model turns, and not routed through the daemon/socket at all (they
+call the Anthropic API directly from whichever process calls them). Unlike
+`daemonCall`, there is no no-call/call-consumed double-spend concern here,
+so the outcome vocabulary names what actually happened instead:
 
 ```ts
 import { listModels, retrieveModel } from "@th-yoo/cc-api-daemon"
@@ -131,9 +189,6 @@ what was collected and returns `error`.
 
 ## Known limitations
 
-- `ensureDaemon`'s `waitMs` is accepted-and-ignored — there is nothing to
-  wait for in a single process. This is a semantic drift from the original
-  surface that a knowing caller would trip on.
 - `canonicalModel === model` always — the raw API exposes exactly one
   identity field, so `modelProvenBy`'s `canonicalModel` branch is dead code
   here. Documented, not "fixed".
@@ -147,15 +202,28 @@ what was collected and returns `error`.
   (also `ANTHROPIC_LOG`, `ANTHROPIC_WEBHOOK_SIGNING_KEY`) unconditionally
   from the real `process.env`, with no constructor option to suppress them —
   unclosable, documented.
-- `budgetMs` bounds the HTTP phase only; keychain/file auth resolution runs
-  before it with its own ~10s worst-case, so worst-case wall-clock is
-  roughly `budgetMs + 10s`.
+- `budgetMs` on `daemonCall`/`closeSession` bounds the client-side socket
+  phase only; daemon-side turn budgeting (queue wait, generation, auth
+  resolution) is `ACP_BUDGET`'s own set of legs, not this parameter.
+- `listModels`/`retrieveModel`'s `budgetMs` becomes the SDK client's
+  per-HTTP-request `timeout`, which only starts once the request itself
+  begins — credential resolution (`buildClient` → `resolveAuth`) runs
+  synchronously before that, with its own ~10s darwin-keychain worst case,
+  so total wall-clock can run to roughly `budgetMs + 10s`. Unlike
+  `daemonCall`'s turn, there is no outer deadline wrapping both phases here.
 - `listModels`'s `budgetMs` bounds each individual HTTP request in a
   pagination walk, not the total time to drain all pages — a multi-page
   catalog issues one request per page, each independently bounded.
 - `listModels`/`retrieveModel` don't expose the Models API's `betas`
   parameter yet — add later as its own deliberate widening if a caller
   needs a beta-gated model list.
+- A cancel (`session/cancel`) written in the same socket write as its target
+  `session/prompt` cannot preempt that prompt's send on this backend:
+  `ApiSession`'s dispatch loop has no yield point between dequeuing a turn
+  and marking it sent, unlike the CLI-backed daemon this package mirrors,
+  whose dynamic `import()` gave cancel a real pre-send window. Tracked as a
+  design question, not silently patched over — see `test/acp-daemon.test.ts`'s
+  two `test.todo` cases for the full trace.
 
 ## License
 
