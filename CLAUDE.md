@@ -44,7 +44,7 @@ below exists to make that structurally hard, not just discouraged.
 
 1. **The enforceable invariant**: `env -u ANTHROPIC_API_KEY -u
    ANTHROPIC_AUTH_TOKEN HOME=/tmp/no-creds bun test` must pass — currently
-   187 pass / 0 fail. No test outcome may depend on host credentials. This
+   247 pass / 0 fail. No test outcome may depend on host credentials. This
    is the check that would have caught a real bug on its first commit
    instead of three commits later: Task 6's two reenabled describe blocks
    (`acp-client.test.ts`'s e2e test, `acp-daemon.test.ts`'s "reaches the
