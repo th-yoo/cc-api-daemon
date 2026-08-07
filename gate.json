@@ -1,0 +1,5 @@
+{
+  "check": "bun test",
+  "rounds": 2,
+  "gauge": false
+}
