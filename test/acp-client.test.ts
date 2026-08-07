@@ -234,6 +234,31 @@ describe("acp-client (fake daemons only — no CLI, no model)", () => {
     expect(fake.sawPrompt()).toBe(false)
   })
 
+  test("Task 8: a daemon whose worst case exceeds the client budget is refused pre-send", async () => {
+    const sock = tempSock("worstcase-refuse")
+    const env = { ...ENV, KKAMAK_ACP_SOCKET: sock }
+    // budgetMs (500) < daemonWorstCaseMs (999_000): the client must refuse
+    // before session/prompt is ever written, same as the fingerprint-
+    // mismatch case above — law L1, no-call.
+    const fake = fakeDaemon(sock, { fingerprint: envFingerprint(env), daemonWorstCaseMs: 999_000, answer: "ok" })
+    LIVE_FAKES.push(fake)
+    const r = await daemonCall("x", HAIKU, env, { ...ISO, budgetMs: 500 })
+    expect(r.kind).toBe("no-call")
+    expect(fake.sawPrompt()).toBe(false)
+  })
+
+  test("Task 8: a daemon that omits daemonWorstCaseMs is accepted — older daemons stay compatible", async () => {
+    const sock = tempSock("worstcase-omit")
+    const env = { ...ENV, KKAMAK_ACP_SOCKET: sock }
+    // No daemonWorstCaseMs field at all (undefined, the fake's default) —
+    // additive/optional field, must not block a daemon that predates it.
+    const fake = fakeDaemon(sock, { fingerprint: envFingerprint(env), answer: "ok" })
+    LIVE_FAKES.push(fake)
+    const r = await daemonCall("x", HAIKU, env, ISO)
+    expect(r.kind).toBe("ok")
+    expect(fake.sawPrompt()).toBe(true)
+  })
+
   test("ROUND-4 I4: lane selection and socket path do NOT change the client's fingerprint", async () => {
     const sock = tempSock("i4")
     const envA = { ...ENV, KKAMAK_ACP_SOCKET: sock, KKAMAK_GAUGE_TRANSPORT: "sdk" }

@@ -46,6 +46,11 @@ export type FakeAnswer =
 export interface FakeDaemonOpts {
   /** echoed in initialize._meta; pass envFingerprint(theEnvUnderTest) */
   fingerprint: string
+  /** Task 8: echoed in initialize._meta.kkamak.daemonWorstCaseMs when
+   * present; omitted entirely when undefined (the default) — a fake that
+   * always sent SOME number could never exercise the client's
+   * older-daemon-compatibility path (a daemon predating this field). */
+  daemonWorstCaseMs?: number
   answer: FakeAnswer
   /** text the "ok" answer carries; default "ANSWER" */
   text?: string
@@ -175,9 +180,11 @@ export function fakeDaemon(sock: string, opts: FakeDaemonOpts): FakeDaemonHandle
         switch (method) {
           case ACP_INITIALIZE: {
             if (id === undefined) break
+            const kkamak: { envFingerprint: string; daemonWorstCaseMs?: number } = { envFingerprint: opts.fingerprint }
+            if (opts.daemonWorstCaseMs !== undefined) kkamak.daemonWorstCaseMs = opts.daemonWorstCaseMs
             write({
               jsonrpc: "2.0", id,
-              result: { protocolVersion: 1, agentCapabilities: { loadSession: false }, _meta: { kkamak: { envFingerprint: opts.fingerprint } } },
+              result: { protocolVersion: 1, agentCapabilities: { loadSession: false }, _meta: { kkamak } },
             })
             break
           }

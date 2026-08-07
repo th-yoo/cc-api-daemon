@@ -65,6 +65,7 @@ import {
   ACP_INITIALIZE, ACP_SESSION_NEW, ACP_SESSION_PROMPT, ACP_SESSION_CANCEL, ACP_SESSION_UPDATE,
   ACP_SESSION_CLOSE,
   ACP_ERR_NO_CALL, ACP_ERR_CALL_CONSUMED,
+  ACP_BUDGET,
   type WarmIsolation,
 } from "./acp-wire.ts"
 
@@ -236,7 +237,7 @@ export function createDispatcher(pool: SessionPool, state: DaemonState, fingerpr
           respond({
             protocolVersion: 1,
             agentCapabilities: { loadSession: false },
-            _meta: { kkamak: { envFingerprint: fingerprint } },
+            _meta: { kkamak: { envFingerprint: fingerprint, daemonWorstCaseMs: ACP_BUDGET.daemonWorstCaseMs } },
           })
           return
         }

@@ -216,6 +216,17 @@ export function daemonCall(
       const init = (await request(ACP_INITIALIZE, { protocolVersion: 1 })) as AcpInitializeResult | undefined
       if (init?._meta?.kkamak?.envFingerprint !== fp) { finish({ kind: "no-call" }); return }
 
+      // Task 8: the clientBudgetMs > daemonWorstCaseMs contract (acp-wire.ts's
+      // ACP_BUDGET) used to hold for free — one object, one repo. Forked,
+      // the two numbers live in separate repos with nothing checking them; a
+      // drift lets the CLIENT time out before the daemon does, report
+      // no-call for a turn the daemon may still deliver, and bill the
+      // record twice on retry. Same refusal path as the fingerprint check
+      // above (law L1, pre-send, no-call): a daemon that predates this
+      // field (dw undefined) is accepted exactly as before.
+      const dw = init?._meta?.kkamak?.daemonWorstCaseMs
+      if (typeof dw === "number" && dw >= budgetMs) { finish({ kind: "no-call" }); return }
+
       const newSessionParams = {
         cwd: "/", mcpServers: [], _meta: { kkamak: { isolation: opts.isolation } },
       } satisfies AcpNewSessionParams

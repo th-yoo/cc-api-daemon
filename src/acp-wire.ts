@@ -193,9 +193,23 @@ export const GAUGE_ISOLATION: WarmIsolation = {
 export interface AcpInitializeResult {
   protocolVersion: number
   agentCapabilities: { loadSession: false }
-  /** §6e instrument fingerprint — the client refuses a daemon whose
-   * fingerprint differs from its own (pre-send => law L1 => no-call). */
-  _meta: { kkamak: { envFingerprint: string } }
+  _meta: {
+    kkamak: {
+      /** §6e instrument fingerprint — the client refuses a daemon whose
+       * fingerprint differs from its own (pre-send => law L1 => no-call). */
+      envFingerprint: string
+      /** The daemon's own worst-case turn budget (`ACP_BUDGET.daemonWorstCaseMs`).
+       * ADDITIVE and OPTIONAL: a daemon that predates this field is exactly
+       * as safe as it was, and a client that ignores it is too. Present so
+       * the `clientBudgetMs > daemonWorstCaseMs` contract survives the two
+       * sides living in separate repos — under the fork, nothing else
+       * checks that inequality, and a drift there converts a
+       * `call-consumed` into a `no-call` (the client times out and
+       * concludes nothing was sent, so a caller retries an already-billed
+       * turn). */
+      daemonWorstCaseMs?: number
+    }
+  }
 }
 /** N3c-iii: `session/new` gains the isolation VALUE, required (never
  * defaulted — the same "no magic selection" rule `AcpPromptParams.model`
