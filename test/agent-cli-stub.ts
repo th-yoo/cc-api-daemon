@@ -147,7 +147,18 @@ export function hangFirstServer(text: string, model = "claude-haiku-4-5"): { url
       if (!body) return new Response(null, { status: 200 })   // HEAD /api/hello probe
       n++
       if (n === 1) return new Promise<Response>(() => {})
-      return sseText(text, model)
+      // Plain JSON, not sseText(): api-session.ts's sendOne calls the real
+      // @anthropic-ai/sdk's messages.create WITHOUT stream:true (non-streaming
+      // default) — sseText() matched the OLD agent-SDK-CLI transport, which
+      // always sent stream:true. This helper's only two consumers are both
+      // in the ApiSession-backed daemon suite (Task 6), so fixed here rather
+      // than adding a parallel helper.
+      return Response.json({
+        id: "msg_stub", type: "message", role: "assistant", model,
+        content: [{ type: "text", text }],
+        stop_reason: "end_turn", stop_sequence: null,
+        usage: { input_tokens: 1, output_tokens: 1 },
+      })
     },
   })
   return { url: `http://127.0.0.1:${s.port}`, stop: () => s.stop(true), count: () => n }

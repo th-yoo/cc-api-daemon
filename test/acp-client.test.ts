@@ -21,8 +21,7 @@ import { ACP_BUDGET, modelProvenBy, type WarmIsolation } from "../src/acp-wire.t
 import { envFingerprint, spawnLockPath, tryCreateLock } from "../src/acp-paths.ts"
 import { fakeDaemon } from "./acp-fake-daemon.ts"
 import { shortSock } from "./sock-path.ts"
-import { sseText } from "./agent-cli-stub.ts"
-import { stubServer } from "./sdk-stub.ts"
+import { stubServer, okResponse } from "./sdk-stub.ts"
 
 const HAIKU = "claude-haiku-4-5"
 // Replaces the gauge's own GAUGE_ISOLATION, which was caller-side and this
@@ -393,19 +392,26 @@ describe("acp-client (fake daemons only — no CLI, no model)", () => {
   })
 })
 
-// Task 1 of the api-sdk-swap plan ports the agnostic core with NO session
-// backend (src/acp-daemon.ts's `backendNotWiredYet` placeholder). This test
-// dispatches a real daemonCall through a really-spawned daemon and expects
-// the stubbed model's answer back — needs ApiSession (Task 4) wired in as
-// the pool's default (Task 5). Unconditionally skipped until then;
-// re-enable (drop `.skip`, restore the CLI-credentials gate this block also
-// needs) as part of Task 5.
-describe.skip("acp-client e2e (real daemon + SSE stub)", () => {
+// Re-enabled (Task 6, gate-debt paydown): skipped from Task 1 through Task
+// 5 because it dispatches a real daemonCall through a really-spawned daemon
+// and needed ApiSession wired in as the pool's default. Runs against
+// ApiSession + the local stub now — deliberately NOT gated on
+// HAS_CLAUDE_CODE_CREDENTIALS: that credential requirement belonged to the
+// old agent-SDK-CLI transport (a spawned Claude Code CLI resolving its own
+// keychain credentials); this backend's daemon resolves auth from its own
+// env (auth.ts), no CLI involved.
+describe("acp-client e2e (real daemon + stub)", () => {
   test("ensureDaemon + daemonCall against the real daemon", async () => {
     const sock = tempSock("e2e")
     const spawnLog = `${sock}.spawnlog`
     LIVE_DAEMONS.push({ sock, spawnLog })
-    const cap = stubServer(() => sseText("ANSWER"))
+    // Plain JSON, not sseText(): sendOne (api-session.ts's leaf) calls the
+    // real @anthropic-ai/sdk's messages.create WITHOUT stream:true, which
+    // defaults to non-streaming — sseText() matched the OLD agent-SDK-CLI
+    // transport, which always sent stream:true. Verified by running this
+    // test first: it received call-consumed (an SSE body failing to parse
+    // as the SDK's expected JSON response), not the plan's assumed pass.
+    const cap = stubServer(() => okResponse("ANSWER"))
     try {
       const env = {
         ...process.env,
