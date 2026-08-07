@@ -55,7 +55,7 @@ import net from "node:net"
 import fs from "node:fs"
 import crypto from "node:crypto"
 import type { TurnOutcome, DispatchableSession } from "./session-contract.ts"
-import { SessionPool } from "./acp-pool.ts"
+import { SessionPool, type WarmConstructOpts } from "./acp-pool.ts"
 import {
   socketPath, ensureSocketDir, bindLockPath, envFingerprint, isPipe,
   acquireAcpLock, releaseAcpLock,
@@ -444,17 +444,6 @@ export function createDispatcher(pool: SessionPool, state: DaemonState, fingerpr
 
 // ── import.meta.main only, below this line ─────────────────────────────
 
-// No session backend is wired at this layer yet — this is Task 1 of the
-// api-sdk-swap plan (agnostic core only, backend absent by design; see
-// acp-pool.ts's now-required `makeSession`). Task 5 threads a real
-// makeSession (ApiSession by default) into these two entry points. Until
-// then this placeholder makes an accidental CLI invocation fail loudly
-// rather than silently defaulting to a backend that doesn't exist yet —
-// unreachable from any test (both call sites are behind `import.meta.main`).
-function backendNotWiredYet(): never {
-  throw new Error("cc-api-daemon: no session backend wired yet (Task 5 of the api-sdk-swap plan)")
-}
-
 // N3c-iii: the direct `new WarmSession(env, warmBudgetOpts(env))` + its
 // env-overridable `turnTimeoutMs` leg are GONE from this file — SessionPool
 // (acp-pool.ts) now owns budget construction for every WarmSession it spawns,
@@ -520,7 +509,10 @@ function bindWithTakeover(server: net.Server, sock: string): Promise<"bound" | "
   })
 }
 
-async function runSocket(env: Record<string, string | undefined>): Promise<void> {
+async function runSocket(
+  env: Record<string, string | undefined>,
+  opts?: { makeSession?: (env: Record<string, string | undefined>, warmOpts: WarmConstructOpts) => DispatchableSession },
+): Promise<void> {
   const sock = socketPath(env)
   const bindLock = bindLockPath(env)
   const fingerprint = envFingerprint(env)
@@ -542,7 +534,8 @@ async function runSocket(env: Record<string, string | undefined>): Promise<void>
     return
   }
 
-  const pool = new SessionPool(env, { makeSession: backendNotWiredYet })
+  // No makeSession override -> the pool's own default (ApiSession, Task 5).
+  const pool = new SessionPool(env, opts?.makeSession ? { makeSession: opts.makeSession } : {})
   const state = createDaemonState()
   const dispatch = createDispatcher(pool, state, fingerprint)
   const sockets = new Set<net.Socket>()
@@ -678,9 +671,13 @@ async function runSocket(env: Record<string, string | undefined>): Promise<void>
  * tooling only (Task 2's scope note — NOT for off-the-shelf editors). No
  * idle reaper: the process's lifetime is tied to stdin, and closing stdin
  * (EOF) tears the session down directly. */
-async function runStdio(env: Record<string, string | undefined>): Promise<void> {
+async function runStdio(
+  env: Record<string, string | undefined>,
+  opts?: { makeSession?: (env: Record<string, string | undefined>, warmOpts: WarmConstructOpts) => DispatchableSession },
+): Promise<void> {
   const fingerprint = envFingerprint(env)
-  const pool = new SessionPool(env, { makeSession: backendNotWiredYet })
+  // No makeSession override -> the pool's own default (ApiSession, Task 5).
+  const pool = new SessionPool(env, opts?.makeSession ? { makeSession: opts.makeSession } : {})
   const state = createDaemonState()
   const dispatch = createDispatcher(pool, state, fingerprint)
   const decoder = new FrameDecoder()

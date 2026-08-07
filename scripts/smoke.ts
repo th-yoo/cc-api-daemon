@@ -1,7 +1,12 @@
 // Live smoke — REAL SPEND (one haiku call). Run deliberately, never in CI:
 //   bun scripts/smoke.ts
-// Exercises the real auth ladder (on a dev machine typically the darwin
-// keychain OAuth lane), one messages.create, and the provenance check.
+// Task 5 of the api-sdk-swap plan: index.ts now points at the real ACP
+// client (acp-client.ts), not the old in-process credential-resolve-and-call.
+// ensureDaemon connects-or-spawns a real daemon over a unix socket;
+// daemonCall is a real round-trip through it. Same real auth ladder (on a
+// dev machine typically the darwin keychain OAuth lane) — it's just
+// resolved daemon-side (ApiSession) now, not in this process — one
+// messages.create, and the provenance check.
 import { ensureDaemon, daemonCall, modelProvenBy, type WarmIsolation } from "../src/index.ts"
 
 const REQUESTED = "claude-haiku-4-5"

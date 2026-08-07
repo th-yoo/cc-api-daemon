@@ -13,6 +13,7 @@
 //
 // node-n3c-ii-brief.md governs over the plan's S2 text where they differ.
 import { ACP_BUDGET, type WarmIsolation } from "./acp-wire.ts"
+import { ApiSession } from "./api-session.ts"
 
 /** The minimal structural interface the pool needs off a warm session —
  * derived from actual pool usage (reap/quiescent/closeAll), so the
@@ -153,19 +154,17 @@ export class SessionPool {
 
   constructor(
     private readonly env: Record<string, string | undefined>,
-    // `makeSession` has NO DEFAULT here (Task 1 of the api-sdk-swap plan:
-    // the agnostic core is ported with no backend yet). It is therefore
-    // REQUIRED, not optional — every caller in this repo (test fakes today;
-    // Task 5's default ApiSession factory, threaded from the daemon entry
-    // point, later) must supply one explicitly. Do not add a fallback here;
-    // Task 5 restores a default by threading `makeSession` out to the
-    // daemon's own constructor options instead, so a host with a different
-    // backend can still inject one.
+    // `makeSession` defaults to `ApiSession` (Task 5) — Task 1 left it
+    // required-with-no-default because no backend existed yet; now one
+    // does. A host wanting a different backend (e.g. meta-harness keeping
+    // its agent-SDK WarmSession) still injects one here, or via the
+    // daemon's own `makeSession` option, threaded straight through
+    // (acp-daemon.ts).
     opts: {
       max?: number
       sessionIdleMs?: number
-      makeSession: (env: Record<string, string | undefined>, warmOpts: WarmConstructOpts) => WarmSessionLike
-    },
+      makeSession?: (env: Record<string, string | undefined>, warmOpts: WarmConstructOpts) => WarmSessionLike
+    } = {},
   ) {
     // Same finiteness standard as parseMaxSessions' env path (review
     // finding, 2026-08-04): an explicit `opts.max: NaN` — easy for the next
@@ -177,7 +176,7 @@ export class SessionPool {
     // the cap exists to prevent.
     this.max = opts.max !== undefined && Number.isFinite(opts.max) ? Math.max(1, Math.trunc(opts.max)) : parseMaxSessions(env)
     this.sessionIdleMs = opts.sessionIdleMs ?? DEFAULT_SESSION_IDLE_MS
-    this.makeSession = opts.makeSession
+    this.makeSession = opts.makeSession ?? ((e, warmOpts) => new ApiSession(e, warmOpts))
   }
 
   /** Never queues, never blocks. An idle entry with DEEP-EQUAL isolation is

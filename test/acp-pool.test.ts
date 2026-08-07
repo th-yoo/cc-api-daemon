@@ -3,13 +3,13 @@
 // drives a turn itself, it only hands out entries and tracks idle/busy.
 //
 // node-n3c-ii-brief.md governs. The 9-test sketch there is adapted 1:1
-// below (numbered in each test's describe/name). Ported without a backend
-// (Task 1 of the api-sdk-swap plan): `makeSession` has no default here, so
-// every pool in this file is constructed with an explicit DI fake — there
-// is no "real backend" test until ApiSession lands.
+// below (numbered in each test's describe/name). Every test here still uses
+// an explicit DI fake (makeSession) except the "default backend" describe
+// block at the bottom (Task 5), which pins the real ApiSession default.
 import { describe, expect, test } from "bun:test"
 import { ACP_BUDGET, type WarmIsolation } from "../src/acp-wire.ts"
 import { SessionPool, type WarmConstructOpts, type WarmSessionLike } from "../src/acp-pool.ts"
+import { ApiSession } from "../src/api-session.ts"
 
 // Two distinct fixture isolations for segregation tests — arbitrary
 // content, deliberately different from each other. Replaces the gauge's
@@ -453,5 +453,29 @@ describe("SessionPool.acquire — explicit makeSession budget legs", () => {
     const a = absent.acquire(TEST_ISOLATION, now)
     expect(a.ok).toBe(true)
     if (a.ok) expect(asFake(a.entry.warm).opts.turnTimeoutMs).toBe(ACP_BUDGET.turnTimeoutMs)
+  })
+})
+
+// Task 5: the "no real backend" era from Task 1's header comment ends here —
+// ApiSession is now the pool's default when makeSession is omitted.
+describe("SessionPool — default backend (Task 5)", () => {
+  test("the pool builds ApiSessions by default", () => {
+    const pool = new SessionPool(ENV, { max: 1 })
+    const got = pool.acquire(TEST_ISOLATION, Date.now())
+    expect(got.ok).toBe(true)
+    if (!got.ok) throw new Error("unreachable")
+    expect(got.entry.warm).toBeInstanceOf(ApiSession)
+    pool.closeAll()
+  })
+
+  test("an injected makeSession overrides the default", () => {
+    let built = 0
+    const pool = new SessionPool(ENV, {
+      max: 1,
+      makeSession: () => { built++; return { turnInFlight: () => false, close: () => {} } },
+    })
+    pool.acquire(TEST_ISOLATION, Date.now())
+    expect(built).toBe(1)
+    pool.closeAll()
   })
 })

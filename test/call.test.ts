@@ -1,18 +1,22 @@
-// call.test.ts — the outcome-law suite for daemonCall, run entirely against
+// call.test.ts — the outcome-law suite for sendOne, run entirely against
 // a LOCAL Bun.serve stub of POST /v1/messages. ZERO real API spend, ever.
 //
-// Determinism rule (enforced throughout): EVERY daemonCall passes `env`
+// Determinism rule (enforced throughout): EVERY sendOne passes `env`
 // explicitly with ANTHROPIC_BASE_URL pointed at the stub; the zero-hit
 // cases additionally pin auth via env/authDeps so host keychain state can
 // never leak in. Only the two poisoning tests touch process.env — and they
 // set AND restore it in try/finally.
 //
-// Stub-server harness now lives in helpers.ts (Task 4a of the api-sdk-swap
-// plan) so api-session.test.ts can share it — the assertions below are
-// byte-unchanged, only their setup calls are re-pointed.
+// Retargeted from daemonCall to sendOne (Task 5 of the api-sdk-swap plan):
+// daemonCall/ensureDaemon/closeSession are deleted from call.ts (index.ts
+// now points at the real acp-client.ts trio instead — see that file's own
+// test/acp-client.test.ts). sendOne shares call.ts's ambient-env-leak
+// guards and outcome law with the deleted daemonCall, so this coverage
+// carries over rather than being lost; TurnOutcome has no sessionId field,
+// so every sessionId-specific assertion from the old suite is dropped.
 import { beforeEach, describe, expect, test } from "bun:test"
-import { daemonCall, ensureDaemon, closeSession } from "../src/call.ts"
-import { modelProvenBy, type DaemonOutcome } from "../src/types.ts"
+import { sendOne } from "../src/call.ts"
+import { modelProvenBy } from "../src/acp-wire.ts"
 import {
   STUB_URL, STUB_PORT, okBody, setRespond, getCaptured, resetStub,
   apiKeyEnv, oauthEnv, emptyHomeDeps, restoreEnvKey, ISO,
@@ -28,23 +32,17 @@ beforeEach(() => {
   resetStub()
 })
 
-function expectSessionId(out: DaemonOutcome): void {
-  expect(typeof out.sessionId).toBe("string")
-  expect(out.sessionId!.length).toBeGreaterThan(0)
-}
-
 // ── 1. ok path ─────────────────────────────────────────────────────────────
 
 describe("ok path", () => {
-  test("success → kind ok, text, dated model on both fields, sessionId, modelProvenBy", async () => {
+  test("success → kind ok, text, dated model on both fields, modelProvenBy", async () => {
     setRespond(() => okBody("hello", DATED_MODEL))
-    const out = await daemonCall("hi", ALIAS_MODEL, apiKeyEnv(), { isolation: ISO })
+    const out = await sendOne("hi", ALIAS_MODEL, apiKeyEnv(), { isolation: ISO })
     expect(out.kind).toBe("ok")
     if (out.kind !== "ok") throw new Error("unreachable")
     expect(out.text).toBe("hello")
     expect(out.model).toBe(DATED_MODEL)
     expect(out.canonicalModel).toBe(DATED_MODEL)
-    expectSessionId(out)
     expect(modelProvenBy(out.model, ALIAS_MODEL, out.canonicalModel)).toBe(true)
   })
 
@@ -66,7 +64,7 @@ describe("ok path", () => {
         usage: { input_tokens: 1, output_tokens: 1 },
       }),
     )
-    const out = await daemonCall("hi", ALIAS_MODEL, apiKeyEnv(), { isolation: ISO })
+    const out = await sendOne("hi", ALIAS_MODEL, apiKeyEnv(), { isolation: ISO })
     expect(out.kind).toBe("ok")
     if (out.kind !== "ok") throw new Error("unreachable")
     expect(out.text).toBe("ABCD")
@@ -77,14 +75,14 @@ describe("ok path", () => {
 
 describe("auth headers", () => {
   test("apiKey lane → x-api-key set, NO authorization header", async () => {
-    await daemonCall("hi", ALIAS_MODEL, apiKeyEnv(), { isolation: ISO })
+    await sendOne("hi", ALIAS_MODEL, apiKeyEnv(), { isolation: ISO })
     expect(getCaptured().length).toBe(1)
     expect(getCaptured()[0]!.headers.get("x-api-key")).toBe("k")
     expect(getCaptured()[0]!.headers.get("authorization")).toBeNull()
   })
 
   test("OAuth lane → authorization Bearer, NO x-api-key, oauth beta header", async () => {
-    await daemonCall("hi", ALIAS_MODEL, oauthEnv(), { isolation: ISO })
+    await sendOne("hi", ALIAS_MODEL, oauthEnv(), { isolation: ISO })
     expect(getCaptured().length).toBe(1)
     expect(getCaptured()[0]!.headers.get("authorization")).toBe("Bearer t")
     expect(getCaptured()[0]!.headers.get("x-api-key")).toBeNull()
@@ -96,14 +94,13 @@ describe("auth headers", () => {
 
 describe("pre-auth no-call", () => {
   test("no credentials resolvable → no-call, zero requests (empty-home authDeps)", async () => {
-    const out = await daemonCall(
+    const out = await sendOne(
       "hi",
       ALIAS_MODEL,
       { ANTHROPIC_BASE_URL: STUB_URL },
       { isolation: ISO, authDeps: emptyHomeDeps() },
     )
     expect(out.kind).toBe("no-call")
-    expectSessionId(out)
     expect(getCaptured().length).toBe(0)
   })
 })
@@ -117,7 +114,7 @@ describe("ambient process.env poisoning", () => {
     process.env.ANTHROPIC_AUTH_TOKEN = "poison"
     process.env.ANTHROPIC_BASE_URL = "http://127.0.0.1:1"
     try {
-      const out = await daemonCall("hi", ALIAS_MODEL, apiKeyEnv(), { isolation: ISO })
+      const out = await sendOne("hi", ALIAS_MODEL, apiKeyEnv(), { isolation: ISO })
       expect(out.kind).toBe("ok")
       expect(getCaptured().length).toBe(1)
       expect(getCaptured()[0]!.headers.get("x-api-key")).toBe("k")
@@ -134,7 +131,7 @@ describe("ambient process.env poisoning", () => {
     const savedKey = process.env.ANTHROPIC_API_KEY
     process.env.ANTHROPIC_API_KEY = "poison"
     try {
-      const out = await daemonCall("hi", ALIAS_MODEL, oauthEnv(), { isolation: ISO })
+      const out = await sendOne("hi", ALIAS_MODEL, oauthEnv(), { isolation: ISO })
       expect(out.kind).toBe("ok")
       expect(getCaptured().length).toBe(1)
       expect(getCaptured()[0]!.headers.get("x-api-key")).toBeNull()
@@ -149,13 +146,13 @@ describe("ambient process.env poisoning", () => {
 
 describe("system param", () => {
   test("systemPrompt \"\" → request body has NO system key", async () => {
-    await daemonCall("hi", ALIAS_MODEL, apiKeyEnv(), { isolation: ISO })
+    await sendOne("hi", ALIAS_MODEL, apiKeyEnv(), { isolation: ISO })
     expect(getCaptured().length).toBe(1)
     expect("system" in getCaptured()[0]!.body).toBe(false)
   })
 
   test("non-empty systemPrompt → body.system carries it verbatim", async () => {
-    await daemonCall("hi", ALIAS_MODEL, apiKeyEnv(), {
+    await sendOne("hi", ALIAS_MODEL, apiKeyEnv(), {
       isolation: { ...ISO, systemPrompt: "be terse" },
     })
     expect(getCaptured().length).toBe(1)
@@ -167,11 +164,10 @@ describe("system param", () => {
 
 describe("thinking", () => {
   test("thinking { type: \"enabled\" } → no-call, zero stub hits", async () => {
-    const out = await daemonCall("hi", ALIAS_MODEL, apiKeyEnv(), {
+    const out = await sendOne("hi", ALIAS_MODEL, apiKeyEnv(), {
       isolation: { ...ISO, thinking: { type: "enabled" } },
     })
     expect(out.kind).toBe("no-call")
-    expectSessionId(out)
     expect(getCaptured().length).toBe(0)
   })
 })
@@ -181,7 +177,7 @@ describe("thinking", () => {
 describe("call-consumed arms", () => {
   test("HTTP 500 → call-consumed, EXACTLY one request (maxRetries 0 pinned)", async () => {
     setRespond(() => new Response("boom", { status: 500 }))
-    const out = await daemonCall("hi", ALIAS_MODEL, apiKeyEnv(), { isolation: ISO })
+    const out = await sendOne("hi", ALIAS_MODEL, apiKeyEnv(), { isolation: ISO })
     expect(out.kind).toBe("call-consumed")
     expect(getCaptured().length).toBe(1)
   })
@@ -190,14 +186,14 @@ describe("call-consumed arms", () => {
     setRespond(() =>
       Response.json({ type: "error", error: { type: "authentication_error", message: "nope" } }, { status: 401 }),
     )
-    const out = await daemonCall("hi", ALIAS_MODEL, apiKeyEnv(), { isolation: ISO })
+    const out = await sendOne("hi", ALIAS_MODEL, apiKeyEnv(), { isolation: ISO })
     expect(out.kind).toBe("call-consumed")
     expect(getCaptured().length).toBe(1)
   })
 
   test("hanging server + small budgetMs → call-consumed (SDK timeout)", async () => {
     setRespond(() => new Promise<Response>(() => {}))
-    const out = await daemonCall("hi", ALIAS_MODEL, apiKeyEnv(), {
+    const out = await sendOne("hi", ALIAS_MODEL, apiKeyEnv(), {
       isolation: ISO,
       budgetMs: 1_500,
     })
@@ -217,79 +213,76 @@ describe("call-consumed arms", () => {
         usage: { input_tokens: 1, output_tokens: 1 },
       }),
     )
-    const out = await daemonCall("hi", ALIAS_MODEL, apiKeyEnv(), { isolation: ISO })
+    const out = await sendOne("hi", ALIAS_MODEL, apiKeyEnv(), { isolation: ISO })
     expect(out.kind).toBe("call-consumed")
   })
 
   test("only empty-text blocks → call-consumed", async () => {
     setRespond(() => okBody(""))
-    const out = await daemonCall("hi", ALIAS_MODEL, apiKeyEnv(), { isolation: ISO })
+    const out = await sendOne("hi", ALIAS_MODEL, apiKeyEnv(), { isolation: ISO })
     expect(out.kind).toBe("call-consumed")
   })
 })
 
-// ── 12. never-rejects + sessionId on every arm ─────────────────────────────
+// ── 12. never-rejects ───────────────────────────────────────────────────────
 
-describe("never rejects, sessionId everywhere", () => {
-  test("one representative of each arm resolves with a non-empty sessionId", async () => {
+describe("never rejects", () => {
+  test("one representative of each arm resolves without throwing", async () => {
     // ok
     setRespond(() => okBody("ok"))
-    const ok = await daemonCall("hi", ALIAS_MODEL, apiKeyEnv(), { isolation: ISO })
+    const ok = await sendOne("hi", ALIAS_MODEL, apiKeyEnv(), { isolation: ISO })
     expect(ok.kind).toBe("ok")
-    expectSessionId(ok)
 
     // pre-auth no-call
-    const noAuth = await daemonCall(
+    const noAuth = await sendOne(
       "hi",
       ALIAS_MODEL,
       { ANTHROPIC_BASE_URL: STUB_URL },
       { isolation: ISO, authDeps: emptyHomeDeps() },
     )
     expect(noAuth.kind).toBe("no-call")
-    expectSessionId(noAuth)
 
     // thinking no-call
-    const thinking = await daemonCall("hi", ALIAS_MODEL, apiKeyEnv(), {
+    const thinking = await sendOne("hi", ALIAS_MODEL, apiKeyEnv(), {
       isolation: { ...ISO, thinking: { type: "enabled" } },
     })
     expect(thinking.kind).toBe("no-call")
-    expectSessionId(thinking)
 
     // 500 call-consumed
     setRespond(() => new Response("boom", { status: 500 }))
-    const failed = await daemonCall("hi", ALIAS_MODEL, apiKeyEnv(), { isolation: ISO })
+    const failed = await sendOne("hi", ALIAS_MODEL, apiKeyEnv(), { isolation: ISO })
     expect(failed.kind).toBe("call-consumed")
-    expectSessionId(failed)
 
     // hang call-consumed
     setRespond(() => new Promise<Response>(() => {}))
-    const hung = await daemonCall("hi", ALIAS_MODEL, apiKeyEnv(), {
+    const hung = await sendOne("hi", ALIAS_MODEL, apiKeyEnv(), {
       isolation: ISO,
       budgetMs: 1_500,
     })
     expect(hung.kind).toBe("call-consumed")
-    expectSessionId(hung)
   }, 15_000)
 })
 
-// ── 13. ensureDaemon ───────────────────────────────────────────────────────
+// ── 13. sendOne-specific: abort signal + caller-supplied history ───────────
+// New surface daemonCall never had — added for ApiSession's cancel/FIFO.
 
-describe("ensureDaemon", () => {
-  test("true with ANTHROPIC_API_KEY in env", async () => {
-    await expect(ensureDaemon({ ANTHROPIC_API_KEY: "k", ANTHROPIC_BASE_URL: STUB_URL })).resolves.toBe(true)
+describe("sendOne-specific", () => {
+  test("an aborted request is call-consumed, never no-call", async () => {
+    const ac = new AbortController()
+    setRespond(() => new Promise<Response>(() => {}))
+    const p = sendOne("x", ALIAS_MODEL, apiKeyEnv(), { isolation: ISO, signal: ac.signal })
+    ac.abort()
+    expect((await p).kind).toBe("call-consumed")
   })
 
-  test("false with empty env + credential-less authDeps, no throw", async () => {
-    await expect(
-      ensureDaemon({ ANTHROPIC_BASE_URL: STUB_URL }, { authDeps: emptyHomeDeps() }),
-    ).resolves.toBe(false)
-  })
-})
-
-// ── 14. closeSession ───────────────────────────────────────────────────────
-
-describe("closeSession", () => {
-  test("stateless no-op → { closed: true }", async () => {
-    await expect(closeSession("whatever", apiKeyEnv())).resolves.toEqual({ closed: true })
+  test("a caller-supplied messages array is forwarded verbatim, not rebuilt from outgoingText", async () => {
+    setRespond(() => okBody("ok"))
+    const messages: Array<{ role: "user" | "assistant"; content: string }> = [
+      { role: "user", content: "first" },
+      { role: "assistant", content: "one" },
+      { role: "user", content: "second" },
+    ]
+    await sendOne("second", ALIAS_MODEL, apiKeyEnv(), { isolation: ISO, messages })
+    expect(getCaptured()[0]!.body.messages).toEqual(messages)
   })
 })

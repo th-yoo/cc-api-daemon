@@ -1,8 +1,7 @@
-// test/api-session.test.ts — sendOne (the leaf) and ApiSession (the FIFO
-// session backend) over the shared local stub (helpers.ts). ZERO real API
-// spend, ever.
+// test/api-session.test.ts — ApiSession (the FIFO session backend) over the
+// shared local stub (helpers.ts). ZERO real API spend, ever. sendOne's own
+// leaf tests live in call.test.ts.
 import { beforeEach, describe, expect, test } from "bun:test"
-import { sendOne } from "../src/call.ts"
 import { ApiSession } from "../src/api-session.ts"
 import type { WarmConstructOpts } from "../src/acp-pool.ts"
 import { ISO, stubEnv, respondWith, resetStub, lastRequestBody } from "./helpers.ts"
@@ -31,36 +30,10 @@ function warmOpts(overrides: Partial<WarmConstructOpts> = {}): WarmConstructOpts
   }
 }
 
-describe("sendOne — the leaf", () => {
-  test("sendOne returns ok with the model the API echoed", async () => {
-    respondWith({ content: [{ type: "text", text: "hi" }], model: "claude-haiku-4-5-20251001" })
-    const out = await sendOne("say hi", "claude-haiku-4-5", stubEnv(), { isolation: ISO })
-    expect(out.kind).toBe("ok")
-    if (out.kind !== "ok") throw new Error("unreachable")
-    expect(out.text).toBe("hi")
-    expect(out.model).toBe("claude-haiku-4-5-20251001")
-    expect(out.canonicalModel).toBe("claude-haiku-4-5-20251001")
-  })
-
-  test("an aborted request is call-consumed, never no-call", async () => {
-    const ac = new AbortController()
-    respondWith({ delayMs: 5_000, content: [], model: "m" })
-    const p = sendOne("x", "claude-haiku-4-5", stubEnv(), { isolation: ISO, signal: ac.signal })
-    ac.abort()
-    expect((await p).kind).toBe("call-consumed")
-  })
-
-  test("sendOne forwards a caller-supplied messages array verbatim", async () => {
-    respondWith({ content: [{ type: "text", text: "ok" }], model: "claude-haiku-4-5" })
-    const messages: Array<{ role: "user" | "assistant"; content: string }> = [
-      { role: "user", content: "first" },
-      { role: "assistant", content: "one" },
-      { role: "user", content: "second" },
-    ]
-    await sendOne("second", "claude-haiku-4-5", stubEnv(), { isolation: ISO, messages })
-    expect(lastRequestBody().messages).toEqual(messages)
-  })
-})
+// sendOne's own leaf tests (ok, abort, messages-forwarding) live in
+// call.test.ts now, alongside its full outcome-law suite (retargeted from
+// the deleted daemonCall — Task 5) rather than duplicated here. This file
+// covers ApiSession-level behavior only: lifecycle, oneShot/FIFO, cancel.
 
 describe("ApiSession — lifecycle", () => {
   test("a fresh session is not in flight and closes idempotently", () => {

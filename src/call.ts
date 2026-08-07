@@ -1,6 +1,6 @@
-// call.ts — the single-process @anthropic-ai/sdk twin of meta-harness
-// src/acp's client surface. One `messages.create` per `daemonCall`, with the
-// no-call/call-consumed send-boundary law preserved in-process:
+// call.ts — the ACP daemon's one-call leaf (ApiSession.drain, api-session.ts).
+// One `messages.create` per `sendOne`, with the no-call/call-consumed
+// send-boundary law:
 //   no-call        = provably nothing went toward the model
 //   call-consumed  = any ambiguity at/after `messages.create`
 // Outcome-law + client-construction conventions adapted from meta-harness
@@ -8,104 +8,35 @@
 // machinery that doesn't apply here (structured-output schemas, transport
 // selection, stopReason plumbing) is deliberately not carried over.
 //
-// Top-level static import is fine: this is a single-purpose package with no
-// hook-latency constraint (unlike the gate plugin, which lazy-loads).
-import type { WarmIsolation, DaemonOutcome } from "./types.ts"
-import { resolveAuth, type AuthDeps } from "./auth.ts"
+// Task 5 of the api-sdk-swap plan: this file used to also hold an
+// in-process daemonCall/ensureDaemon/closeSession trio — a single-process
+// twin of the real ACP client, kept alive from Task 1 through Task 4
+// because index.ts exported it and deleting it earlier would have broken
+// that export mid-task (the gate made duplication cheap, deletion
+// expensive — see Task 5 Step 4a). index.ts now points at the real
+// acp-client.ts trio instead, so the twin is gone; sendOne — the only
+// thing that was ever genuinely new here — is what remains.
 import { buildClient } from "./client.ts"
-import type { WarmIsolation as AcpWarmIsolation } from "./acp-wire.ts"
+import type { AuthDeps } from "./auth.ts"
+import type { WarmIsolation } from "./acp-wire.ts"
 import type { TurnOutcome } from "./session-contract.ts"
 
 const DEFAULT_BUDGET_MS = 60_000
 const DEFAULT_MAX_TOKENS = 2_048
 
-/** One model call. NEVER throws — the returned promise never rejects; every
- * failure mode is folded into a DaemonOutcome arm. */
-export async function daemonCall(
-  outgoingText: string,
-  model: string,
-  env: Record<string, string | undefined>,
-  opts: { isolation: WarmIsolation; budgetMs?: number; maxTokens?: number; authDeps?: AuthDeps },
-): Promise<DaemonOutcome> {
-  // Minted FIRST, before any check runs — carried on every outcome arm,
-  // including the pre-auth no-call (types.ts documents this departure from
-  // the original ACP client, which only set it on `ok`).
-  const sessionId = crypto.randomUUID()
-  const budgetMs = opts.budgetMs ?? DEFAULT_BUDGET_MS
-  const maxTokens = opts.maxTokens ?? DEFAULT_MAX_TOKENS
-
-  // No proven thinking-budget mapping for the raw API request shape — same
-  // refusal as meta-harness minimal/providers/anthropic-api.ts:59-61: an
-  // enabled-thinking isolation is declined up front (nothing sent) rather
-  // than sent with a guessed mapping.
-  if (opts.isolation.thinking.type === "enabled") {
-    return { kind: "no-call", sessionId }
-  }
-
-  // Client construction (incl. auth resolution) lives in client.ts, shared
-  // with listModels/retrieveModel — see its header for the ambient-env-leak
-  // guard rationale. A no-auth resolution and a construction throw are both
-  // pre-send, so both map to the same `no-call` arm here.
-  const resolution = buildClient(env, { budgetMs, authDeps: opts.authDeps })
-  if ("kind" in resolution) return { kind: "no-call", sessionId }
-  const { client } = resolution
-
-  // From here EVERY failure is call-consumed: thrown SDK error, timeout,
-  // HTTP 4xx/5xx. That INCLUDES 401 — uniform post-create classification;
-  // distinguishing status codes (e.g. mapping auth failures back to a
-  // softer arm) is a conscious non-goal: once `messages.create` is entered
-  // we cannot prove nothing reached the model, so the conservative reading
-  // wins (transport.ts's §6e boundary law).
-  try {
-    const response = await client.messages.create({
-      model,
-      max_tokens: maxTokens,
-      messages: [{ role: "user", content: outgoingText }],
-      // `system` key OMITTED entirely when systemPrompt is "" — mirror of
-      // anthropic-api.ts's rule (empty string means "no system prompt",
-      // not "system prompt that is empty").
-      ...(opts.isolation.systemPrompt ? { system: opts.isolation.systemPrompt } : {}),
-    })
-
-    // DELIBERATE departure from transport.ts's first-text-block rule:
-    // concatenate ALL `type === "text"` content blocks, joined with "" —
-    // content blocks read as one continuous stream, so returning only the
-    // first would silently truncate multi-block replies.
-    let text = ""
-    for (const block of response.content) {
-      if (block.type === "text") text += block.text
-    }
-    if (!text) return { kind: "call-consumed", sessionId }
-
-    // canonicalModel === model always here: the raw API exposes exactly one
-    // identity field (`response.model`), so modelProvenBy's canonical-branch
-    // (types.ts:23) is dead in this implementation — documented, not
-    // "fixed"; the caller's reconciliation contract stays uniform.
-    return { kind: "ok", text, model: response.model, canonicalModel: response.model, sessionId }
-  } catch {
-    return { kind: "call-consumed", sessionId }
-  }
-}
-
-/** The ACP daemon's one-call leaf (`ApiSession.drain`, api-session.ts).
- * NOT a rename of `daemonCall` — `daemonCall` stays the single-process
- * public API `index.ts` still exports and cannot be touched here without
- * breaking that export before Task 5 rewires `index.ts` (same reasoning as
- * Task 1 leaving `types.ts`/`call.ts` untouched). `sendOne` is the plan's
- * intended leaf shape added alongside it: no sessionId (the daemon owns
- * session identity via `DaemonState.sessions`), `TurnOutcome` instead of
- * `DaemonOutcome`, an `AbortSignal` so a session can implement `cancel`,
- * and an optional pre-built `messages` array so the caller (a session
- * accumulating its own history) controls conversation continuity — this
- * function stays stateless per call either way. Never throws — same
- * no-call/call-consumed law as `daemonCall`, sharing the same
- * `buildClient` construction and the same ambient-env-leak guards. */
+/** The ACP daemon's one-call leaf. No sessionId (the daemon owns session
+ * identity via `DaemonState.sessions`); returns `TurnOutcome`; accepts an
+ * `AbortSignal` so a session can implement `cancel`, and an optional
+ * pre-built `messages` array so the caller (a session accumulating its own
+ * history) controls conversation continuity — this function stays
+ * stateless per call either way. Never throws — the returned promise never
+ * rejects; every failure mode is folded into a TurnOutcome arm. */
 export async function sendOne(
   outgoingText: string,
   model: string,
   env: Record<string, string | undefined>,
   opts: {
-    isolation: AcpWarmIsolation
+    isolation: WarmIsolation
     budgetMs?: number
     maxTokens?: number
     authDeps?: AuthDeps
@@ -145,30 +76,4 @@ export async function sendOne(
   } catch {
     return { kind: "call-consumed" }
   }
-}
-
-/** Readiness probe = "could a daemonCall resolve credentials right now".
- * Never throws. `waitMs` is accepted-and-ignored: there is no daemon
- * process to wait for in this single-process implementation — the param
- * exists for interface parity with the out-of-process client surface. */
-export async function ensureDaemon(
-  env: Record<string, string | undefined>,
-  opts?: { waitMs?: number; authDeps?: AuthDeps },
-): Promise<boolean> {
-  return resolveAuth(env, opts?.authDeps) !== undefined
-}
-
-/** Stateless no-op. Sessions hold no server-side state here — each
- * daemonCall is a single stateless messages.create, so there is nothing to
- * close; `sessionId`/`env`/`opts` are accepted for interface parity with
- * the ACP client's close-not-release contract. */
-export async function closeSession(
-  sessionId: string,
-  env: Record<string, string | undefined>,
-  opts?: { budgetMs?: number },
-): Promise<{ closed: boolean; reason?: string }> {
-  void sessionId
-  void env
-  void opts
-  return { closed: true }
 }

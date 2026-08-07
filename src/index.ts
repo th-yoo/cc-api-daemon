@@ -1,37 +1,48 @@
 // index.ts — this package's PUBLIC surface.
 //
-// THE RULE: consumers import from THIS FILE, never from a module inside
-// src/ directly (package.json's exports map only resolves ".", so nothing
-// else is even reachable from outside).
+// THE RULE: consumers import from THIS FILE. package.json's exports map
+// resolves only ".", so nothing inside src/ is otherwise reachable. Adding
+// an export here is a deliberate widening — do it on purpose.
 //
-// The interface mirrors meta-harness cc-gate-plugin/src/acp/index.ts —
-// ensureDaemon, daemonCall, DaemonOutcome, closeSession, WarmIsolation,
-// modelProvenBy — with a single-process @anthropic-ai/sdk implementation
-// behind it instead of the out-of-process ACP daemon. Adding an export here
-// is a deliberate widening of the public surface; do it on purpose, not
-// because something happened to need it.
+// Task 5 of the api-sdk-swap plan: this now points at the REAL ACP daemon
+// client (acp-client.ts) instead of the single-process in-process trio that
+// used to live here — the package is the daemon it's named for, not a
+// library that merely resolves credentials and makes one HTTP call itself.
+// serveDaemon is deliberately NOT exported yet: acp-daemon.ts (as ported)
+// has no such function, only runSocket/runStdio invoked from
+// `if (import.meta.main)`, each calling `process.exit()` internally on
+// shutdown — unsafe to call as a library function from a test process.
+// Task 6's own e2e test is where that gets built and proven, per that
+// task's own Step 3 ("adjust the test to the ported modules' real surface").
 
-/** The daemon lifecycle: ensure a call could resolve credentials, then send
- * a turn. `closeSession` is a stateless no-op kept for interface parity. */
-export { ensureDaemon, daemonCall, closeSession } from "./call.ts"
+/** Client side: ensure a daemon is listening, send it a turn, close a
+ * session. Real network I/O now (a unix-socket ACP daemon), not the
+ * former in-process credential-resolve-and-call. */
+export { ensureDaemon, daemonCall, closeSession, type DaemonOutcome } from "./acp-client.ts"
 
-/** Isolation is a VALUE the caller supplies per call, not an id. */
-export type { DaemonOutcome, WarmIsolation } from "./types.ts"
+/** The default backend the daemon runs when nothing else is injected.
+ * Exported so a host can construct one directly, and so `makeSession`
+ * injectors (see acp-pool.ts / acp-daemon.ts) have something to mirror. */
+export { ApiSession } from "./api-session.ts"
 
-/** Model-identity check over what the API actually reported. */
-export { modelProvenBy } from "./types.ts"
+/** Isolation is a VALUE that crosses the wire on session/new, not an id.
+ * This package ships no isolation constant — that is caller-side policy. */
+export type { WarmIsolation } from "./acp-wire.ts"
 
-/** Must be barrel-exported: package.json's exports map only resolves ".",
- * so external consumers could not otherwise name the type (needed to type
- * the injectable `authDeps` seam). Clean-slate addition — not part of the
- * original acp/index.ts surface. */
+/** Model-identity check over what the wire actually reported. */
+export { modelProvenBy } from "./acp-wire.ts"
+
+/** The backend contract, for hosts injecting their own session. */
+export type { DispatchableSession, TurnOutcome, CancelResult } from "./session-contract.ts"
+
+/** Needed to type the injectable auth seam. */
 export type { AuthDeps } from "./auth.ts"
 
 /** Read-only model metadata (GET, not a billed model turn) — deliberately
  * does NOT reuse daemonCall's no-call/call-consumed spend-boundary
  * vocabulary; see models.ts header. No ACP wire precedent for this: the
  * kkamak ACP surface these functions otherwise mirror has no model-list
- * method at all (models.ts header / README). Clean-slate addition, not
- * part of the original acp/index.ts surface — deliberate widening. */
+ * method at all. Clean-slate addition, orthogonal to the daemon swap —
+ * survives Task 5 untouched. */
 export { listModels, retrieveModel } from "./models.ts"
 export type { ModelListOutcome, ModelRetrieveOutcome, ModelInfo } from "./models.ts"
