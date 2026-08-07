@@ -13,6 +13,8 @@
 import type { WarmIsolation, DaemonOutcome } from "./types.ts"
 import { resolveAuth, type AuthDeps } from "./auth.ts"
 import { buildClient } from "./client.ts"
+import type { WarmIsolation as AcpWarmIsolation } from "./acp-wire.ts"
+import type { TurnOutcome } from "./session-contract.ts"
 
 const DEFAULT_BUDGET_MS = 60_000
 const DEFAULT_MAX_TOKENS = 2_048
@@ -82,6 +84,66 @@ export async function daemonCall(
     return { kind: "ok", text, model: response.model, canonicalModel: response.model, sessionId }
   } catch {
     return { kind: "call-consumed", sessionId }
+  }
+}
+
+/** The ACP daemon's one-call leaf (`ApiSession.drain`, api-session.ts).
+ * NOT a rename of `daemonCall` — `daemonCall` stays the single-process
+ * public API `index.ts` still exports and cannot be touched here without
+ * breaking that export before Task 5 rewires `index.ts` (same reasoning as
+ * Task 1 leaving `types.ts`/`call.ts` untouched). `sendOne` is the plan's
+ * intended leaf shape added alongside it: no sessionId (the daemon owns
+ * session identity via `DaemonState.sessions`), `TurnOutcome` instead of
+ * `DaemonOutcome`, an `AbortSignal` so a session can implement `cancel`,
+ * and an optional pre-built `messages` array so the caller (a session
+ * accumulating its own history) controls conversation continuity — this
+ * function stays stateless per call either way. Never throws — same
+ * no-call/call-consumed law as `daemonCall`, sharing the same
+ * `buildClient` construction and the same ambient-env-leak guards. */
+export async function sendOne(
+  outgoingText: string,
+  model: string,
+  env: Record<string, string | undefined>,
+  opts: {
+    isolation: AcpWarmIsolation
+    budgetMs?: number
+    maxTokens?: number
+    authDeps?: AuthDeps
+    signal?: AbortSignal
+    messages?: Array<{ role: "user" | "assistant"; content: string }>
+  },
+): Promise<TurnOutcome> {
+  const budgetMs = opts.budgetMs ?? DEFAULT_BUDGET_MS
+  const maxTokens = opts.maxTokens ?? DEFAULT_MAX_TOKENS
+
+  if (opts.isolation.thinking.type === "enabled") {
+    return { kind: "no-call" }
+  }
+
+  const resolution = buildClient(env, { budgetMs, authDeps: opts.authDeps })
+  if ("kind" in resolution) return { kind: "no-call" }
+  const { client } = resolution
+
+  try {
+    const response = await client.messages.create(
+      {
+        model,
+        max_tokens: maxTokens,
+        messages: opts.messages ?? [{ role: "user", content: outgoingText }],
+        ...(opts.isolation.systemPrompt ? { system: opts.isolation.systemPrompt } : {}),
+      },
+      { signal: opts.signal },
+    )
+
+    let text = ""
+    for (const block of response.content) {
+      if (block.type === "text") text += block.text
+    }
+    if (!text) return { kind: "call-consumed" }
+
+    return { kind: "ok", text, model: response.model, canonicalModel: response.model }
+  } catch {
+    return { kind: "call-consumed" }
   }
 }
 
