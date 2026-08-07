@@ -106,7 +106,7 @@ export function daemonCall(
   env: Record<string, string | undefined>,
   opts: { isolation: WarmIsolation; budgetMs?: number },
 ): Promise<DaemonOutcome> {
-  const budgetMs = opts.budgetMs ?? ACP_BUDGET.daemonLegMs
+  const budgetMs = opts.budgetMs ?? ACP_BUDGET.clientBudgetMs
   const sock = socketPath(env)
   const fp = envFingerprint(env)
 

@@ -310,7 +310,7 @@ describe("acp-client (fake daemons only — no CLI, no model)", () => {
   })
 
   test("the default budget is the contract constant, not a local literal", () => {
-    expect(ACP_BUDGET.daemonLegMs).toBe(36_000)
+    expect(ACP_BUDGET.clientBudgetMs).toBe(30_000)
   })
 
   // No buildAgentOutgoingText test here: that builder lives in

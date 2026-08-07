@@ -63,47 +63,58 @@ export const ACP_ERR_NO_CALL = -32000
  * pending/retryable. */
 export const ACP_ERR_CALL_CONSUMED = -32001
 
-/** §6e instrument invariant: a turn's timers start at the PUSH while the
- * CLI subprocess is still booting, and §6d measured that spawn at
- * 1.25-1.46 s. No WarmSession construction — production or test — may use
- * a `turnTimeoutMs` below this floor, or it cannot distinguish "generation
- * failed" from "the subprocess had not started yet". Round-4 finding C3:
- * a regression test built on a 1 s budget fails a CORRECT implementation
- * deterministically. */
-export const CLI_SPAWN_BUDGET_MS = 8_000
+/** Credential resolution (keychain exec / credentials-file read, auth.ts's
+ * EXEC_TIMEOUT_MS) runs BEFORE the HTTP phase and carries its own 10s worst
+ * case. A turn's timer starts at the PUSH, so the floor exists for the same
+ * reason the CLI spawn floor did upstream (round-4 finding C3: a regression
+ * test built on a too-small budget fails a CORRECT implementation
+ * deterministically) — just a different pre-HTTP cost now that there is no
+ * subprocess to boot. Replaces `CLI_SPAWN_BUDGET_MS` (8 000, sized for a
+ * measured 1.25-1.46s CLI spawn that no longer happens on this backend). */
+export const AUTH_RESOLVE_BUDGET_MS = 10_000
 
 /** §6e budget rule. ONE object, in the module both sides import, because
- * `daemonLegMs > daemonWorstCaseMs` is a CONTRACT: split these across two
+ * `clientBudgetMs > daemonWorstCaseMs` is a CONTRACT: split these across two
  * files and a drift silently converts a `call-consumed` into a `no-call`,
- * i.e. two model calls for one record. Locked by acp-wire.test.ts. */
+ * i.e. two model calls for one record. Locked by acp-wire.test.ts.
+ *
+ * `clearTimeoutMs` and `setModelMs` are INERT on this backend (no `/clear`,
+ * no `setModel` round-trip — the model is a per-request field, not session
+ * state). They remain in the object because `WarmConstructOpts` names every
+ * leg explicitly and the pool passes all of them; `ApiSession` (Task 4)
+ * accepts and ignores these two, documented as such there.
+ *
+ * `minFallbackMs`/`recordBudgetMs` (kkamak CLIENT-side fallback-timing
+ * policy, upstream) and `daemonLegMs` (this repo's OLD name for the client
+ * leg, from when "daemon" and the ACP client library still lived in the
+ * same file under different framing) are DROPPED, not merely renamed: per
+ * the fork ruling (see this repo's plan doc), daemon internals are private
+ * to each implementation and only the wire need agree — a kkamak client's
+ * own fallback/record-budget policy is that repo's concern now, not a field
+ * this daemon's own budget object needs to carry. `clientBudgetMs` below is
+ * `daemonLegMs`'s direct successor for the one role this package's OWN
+ * `daemonCall` (acp-client.ts) still needs: its default `budgetMs`. */
 export const ACP_BUDGET = {
   /** daemon: a turn still queued at this point never reached execute() */
   queueWaitMs: 6_000,
-  /** daemon: `/clear` must be confirmed by conversation_reset within this */
+  /** daemon: inert on this backend — no `/clear`, no `conversation_reset` */
   clearTimeoutMs: 4_000,
-  /** daemon: setModel() is an un-timed SDK control round-trip (sdk.d.ts:2327);
-   * capped so one wedged subprocess cannot hang the FIFO for the daemon's
-   * whole lifetime with no timer armed. */
+  /** daemon: inert on this backend — no setModel round-trip */
   setModelMs: 2_000,
   /** daemon: generation budget, measured from the prompt push. MUST be
-   * >= CLI_SPAWN_BUDGET_MS — the spawn happens inside this window. */
+   * >= AUTH_RESOLVE_BUDGET_MS — auth resolution happens inside this window. */
   turnTimeoutMs: 16_000,
-  /** daemon: grace before destroying the Query when interrupt() hangs */
+  /** daemon: grace before abandoning an aborted request */
   hardGraceMs: 4_000,
-  /** derived: 6 000 + 4 000 + 2 000 + 16 000 + 4 000. Does NOT include the
-   * uncapped lazy `import("@anthropic-ai/claude-agent-sdk")` (~84 ms
-   * measured); an import slow enough to eat the client's slack degrades to
-   * law L2 (call-consumed, a lost retryable record), never to a second
-   * model call. */
-  daemonWorstCaseMs: 32_000,
+  /** derived: 6 000 + 16 000 + 4 000 — the sum of the legs that actually
+   * survive on HTTP. The two inert legs (clearTimeoutMs, setModelMs)
+   * contribute nothing; the old five-leg sum (32 000) included them. */
+  daemonWorstCaseMs: 26_000,
   /** client: MUST exceed daemonWorstCaseMs. The 4 000 ms of slack is the
    * connect + initialize + session/new preamble, which the daemon's own
-   * per-turn clock does not cover. */
-  daemonLegMs: 36_000,
-  /** client: below this remaining, do not start a fallback at all */
-  minFallbackMs: 10_000,
-  /** client: today's CALL_TIMEOUT_MS — per-record latency never exceeds it */
-  recordBudgetMs: 60_000,
+   * per-turn clock does not cover. `daemonCall`'s default `budgetMs`
+   * (acp-client.ts). */
+  clientBudgetMs: 30_000,
 } as const
 
 /** §6e "Which field proves the model", the MATCHING rule — the single

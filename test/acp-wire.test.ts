@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import {
-  FrameDecoder, encodeFrame, ACP_BUDGET, CLI_SPAWN_BUDGET_MS, modelProvenBy,
+  FrameDecoder, encodeFrame, ACP_BUDGET, AUTH_RESOLVE_BUDGET_MS, modelProvenBy,
   ACP_ERR_NO_CALL, ACP_ERR_CALL_CONSUMED,
 } from "../src/acp-wire.ts"
 import type {
@@ -94,35 +94,42 @@ describe("acp-wire framing", () => {
 // §6e budget rule, locked as arithmetic rather than prose: if the client
 // leg ever stops exceeding the daemon's worst case, an ordinary slow turn
 // trips law L2 and the record costs TWO model calls.
+//
+// Re-budgeted for HTTP (Task 3 of the api-sdk-swap plan): clearTimeoutMs/
+// setModelMs are inert on this backend (no /clear, no setModel round-trip),
+// so daemonWorstCaseMs is the sum of the three legs that survive, not all
+// five — the old five-leg sum (32 000) is gone, replaced below.
+// daemonLegMs/minFallbackMs/recordBudgetMs (kkamak's own client-side
+// fallback-timing policy, upstream) are dropped, not renamed — per the
+// fork ruling, that policy is kkamak's repo's concern now, not this
+// daemon's budget object. clientBudgetMs is daemonLegMs's direct successor
+// for the one role this repo's own daemonCall still needs.
 describe("ACP_BUDGET arithmetic (§6e budget rule)", () => {
-  test("the five daemon legs sum to the declared worst case", () => {
-    const b = ACP_BUDGET
-    expect(b.queueWaitMs + b.clearTimeoutMs + b.setModelMs + b.turnTimeoutMs + b.hardGraceMs)
-      .toBe(b.daemonWorstCaseMs)
+  test("daemon worst case is the sum of the legs that survive on HTTP", () => {
+    // Actual-first with the computed (plain-`number`) sum, expected-second
+    // with the `as const`-literal-typed field — not just style: bun:test's
+    // `toBe<T>` ties T to the ACTUAL value, so `expect(<literal 26000>).toBe(<number>)`
+    // fails to compile (expected must be the exact literal type); this
+    // order is the same one the pre-Task-3 version of this test already used.
+    expect(ACP_BUDGET.queueWaitMs + ACP_BUDGET.turnTimeoutMs + ACP_BUDGET.hardGraceMs)
+      .toBe(ACP_BUDGET.daemonWorstCaseMs)
   })
-  test("the client leg strictly exceeds the daemon worst case", () => {
-    expect(ACP_BUDGET.daemonLegMs).toBeGreaterThan(ACP_BUDGET.daemonWorstCaseMs)
+  test("client budget exceeds daemon worst case — drift here double-spends", () => {
+    expect(ACP_BUDGET.clientBudgetMs).toBeGreaterThan(ACP_BUDGET.daemonWorstCaseMs)
   })
   test("the client's slack covers a connect + initialize + session/new preamble", () => {
     // Not decoration: the daemon's clock starts when it accepts the prompt,
     // the client's when it opens the socket. Anything under a second of
     // slack would make an ordinary busy daemon look like law L2.
-    expect(ACP_BUDGET.daemonLegMs - ACP_BUDGET.daemonWorstCaseMs).toBeGreaterThanOrEqual(3_000)
+    expect(ACP_BUDGET.clientBudgetMs - ACP_BUDGET.daemonWorstCaseMs).toBeGreaterThanOrEqual(3_000)
   })
-  test("daemon leg + minimum fallback still fits the per-record budget", () => {
-    expect(ACP_BUDGET.daemonLegMs + ACP_BUDGET.minFallbackMs).toBeLessThanOrEqual(ACP_BUDGET.recordBudgetMs)
-  })
-  test("the per-record budget is unchanged from the incumbent 60s", () => {
-    expect(ACP_BUDGET.recordBudgetMs).toBe(60_000)
-  })
-  test("the generation budget exceeds the measured CLI spawn (round-4 C3)", () => {
-    // A turn's timers start at the PUSH while the subprocess is still
-    // booting; §6d measured that spawn at 1.25-1.46s. A turnTimeoutMs at or
-    // below it cannot distinguish "generation failed" from "not started
-    // yet". CLI_SPAWN_BUDGET_MS is the floor every WarmSession
-    // construction, production or test, must clear.
-    expect(CLI_SPAWN_BUDGET_MS).toBe(8_000)
-    expect(ACP_BUDGET.turnTimeoutMs).toBeGreaterThanOrEqual(CLI_SPAWN_BUDGET_MS)
+  test("turnTimeoutMs is floored by auth resolution, not by a CLI spawn", () => {
+    // A turn's timers start at the PUSH while credentials are still being
+    // resolved (keychain exec / credentials-file read, auth.ts's
+    // EXEC_TIMEOUT_MS — same reasoning as the CLI-spawn floor this replaces,
+    // different pre-HTTP cost). A turnTimeoutMs at or below it cannot
+    // distinguish "generation failed" from "auth had not resolved yet".
+    expect(ACP_BUDGET.turnTimeoutMs).toBeGreaterThanOrEqual(AUTH_RESOLVE_BUDGET_MS)
   })
 })
 

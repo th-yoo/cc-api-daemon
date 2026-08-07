@@ -18,7 +18,7 @@ import { tmpdir } from "node:os"
 import { sseText, hangFirstServer, until } from "./agent-cli-stub.ts"
 import { stubServer } from "./sdk-stub.ts"
 import {
-  FrameDecoder, encodeFrame, ACP_ERR_NO_CALL, ACP_ERR_CALL_CONSUMED, CLI_SPAWN_BUDGET_MS,
+  FrameDecoder, encodeFrame, ACP_ERR_NO_CALL, ACP_ERR_CALL_CONSUMED, AUTH_RESOLVE_BUDGET_MS,
   type WarmIsolation,
 } from "../src/acp-wire.ts"
 import { envFingerprint } from "../src/acp-paths.ts"
@@ -1100,7 +1100,7 @@ describe.skip("acp-daemon over unix socket (reaches the stubbed model)", () => {
     const e = tempEndpoint("unreachable"); LIVE.push(e)
     spawnDaemon(e.sock, e.spawnLog, {
       ANTHROPIC_BASE_URL: "http://127.0.0.1:9",
-      KKAMAK_ACP_TURN_TIMEOUT_MS: String(CLI_SPAWN_BUDGET_MS),
+      KKAMAK_ACP_TURN_TIMEOUT_MS: String(AUTH_RESOLVE_BUDGET_MS),
     })
     await waitForSpawnLog(e.spawnLog, 1, 15_000)
     const c = await connectNdjson(e.sock)
@@ -1119,7 +1119,7 @@ describe.skip("acp-daemon over unix socket (reaches the stubbed model)", () => {
     try {
       spawnDaemon(e.sock, e.spawnLog, {
         ANTHROPIC_BASE_URL: cap.url,
-        KKAMAK_ACP_TURN_TIMEOUT_MS: String(CLI_SPAWN_BUDGET_MS),
+        KKAMAK_ACP_TURN_TIMEOUT_MS: String(AUTH_RESOLVE_BUDGET_MS),
       })
       await waitForSpawnLog(e.spawnLog, 1, 15_000)
       const cA = await connectNdjson(e.sock)
@@ -1182,7 +1182,7 @@ describe.skip("acp-daemon over unix socket (reaches the stubbed model)", () => {
       spawnDaemon(e.sock, e.spawnLog, {
         ANTHROPIC_BASE_URL: cap.url,
         KKAMAK_ACP_MAX_SESSIONS: "1",
-        KKAMAK_ACP_TURN_TIMEOUT_MS: String(CLI_SPAWN_BUDGET_MS),
+        KKAMAK_ACP_TURN_TIMEOUT_MS: String(AUTH_RESOLVE_BUDGET_MS),
       })
       await waitForSpawnLog(e.spawnLog, 1, 15_000)
       const cA = await connectNdjson(e.sock)
