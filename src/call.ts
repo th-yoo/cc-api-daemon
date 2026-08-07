@@ -10,9 +10,9 @@
 //
 // Top-level static import is fine: this is a single-purpose package with no
 // hook-latency constraint (unlike the gate plugin, which lazy-loads).
-import Anthropic from "@anthropic-ai/sdk"
 import type { WarmIsolation, DaemonOutcome } from "./types.ts"
 import { resolveAuth, type AuthDeps } from "./auth.ts"
+import { buildClient } from "./client.ts"
 
 const DEFAULT_BUDGET_MS = 60_000
 const DEFAULT_MAX_TOKENS = 2_048
@@ -40,52 +40,13 @@ export async function daemonCall(
     return { kind: "no-call", sessionId }
   }
 
-  const auth = resolveAuth(env, opts.authDeps)
-  if (auth === undefined) return { kind: "no-call", sessionId }
-
-  let client: Anthropic
-  try {
-    // AMBIENT-ENV LEAK GUARDS (the plan's Critical fix, verified against SDK
-    // 0.115.0 client.js): the SDK defaults any OMITTED (undefined)
-    // apiKey/authToken/baseURL option from the REAL process.env
-    // (ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN / ANTHROPIC_BASE_URL), and
-    // authHeaders() COMPOSES both auth headers with no precedence — a host
-    // carrying the other credential in its ambient env would silently send
-    // BOTH X-Api-Key and Authorization. Therefore:
-    //   - the not-chosen auth field is ALWAYS explicit null in each lane;
-    //   - baseURL is ALWAYS `env.ANTHROPIC_BASE_URL ?? null` — null, never
-    //     omission (undefined re-triggers the process.env default; null
-    //     falls through to the production default URL).
-    // The passed `env` param stays the single authority over what the
-    // client sees.
-    //
-    // maxRetries: 0 — exactly-one-call provable; no retry machinery needed
-    // (and with an explicit apiKey or authToken the SDK's credential-chain
-    // 401-refresh-retry path can never arm).
-    client =
-      "apiKey" in auth
-        ? new Anthropic({
-            apiKey: auth.apiKey,
-            authToken: null,
-            maxRetries: 0,
-            timeout: budgetMs,
-            baseURL: env.ANTHROPIC_BASE_URL ?? null,
-          })
-        : new Anthropic({
-            authToken: auth.authToken,
-            apiKey: null,
-            maxRetries: 0,
-            timeout: budgetMs,
-            // OAuth bearer tokens require this beta on /v1/messages.
-            defaultHeaders: { "anthropic-beta": "oauth-2025-04-20" },
-            baseURL: env.ANTHROPIC_BASE_URL ?? null,
-          })
-  } catch {
-    // Belt-and-suspenders: no realistic throw path exists in construction
-    // (no network I/O happens here), but a throw before `messages.create`
-    // is entered provably sent nothing → no-call.
-    return { kind: "no-call", sessionId }
-  }
+  // Client construction (incl. auth resolution) lives in client.ts, shared
+  // with listModels/retrieveModel — see its header for the ambient-env-leak
+  // guard rationale. A no-auth resolution and a construction throw are both
+  // pre-send, so both map to the same `no-call` arm here.
+  const resolution = buildClient(env, { budgetMs, authDeps: opts.authDeps })
+  if ("kind" in resolution) return { kind: "no-call", sessionId }
+  const { client } = resolution
 
   // From here EVERY failure is call-consumed: thrown SDK error, timeout,
   // HTTP 4xx/5xx. That INCLUDES 401 — uniform post-create classification;

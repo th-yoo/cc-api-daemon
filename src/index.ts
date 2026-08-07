@@ -26,3 +26,12 @@ export { modelProvenBy } from "./types.ts"
  * the injectable `authDeps` seam). Clean-slate addition — not part of the
  * original acp/index.ts surface. */
 export type { AuthDeps } from "./auth.ts"
+
+/** Read-only model metadata (GET, not a billed model turn) — deliberately
+ * does NOT reuse daemonCall's no-call/call-consumed spend-boundary
+ * vocabulary; see models.ts header. No ACP wire precedent for this: the
+ * kkamak ACP surface these functions otherwise mirror has no model-list
+ * method at all (models.ts header / README). Clean-slate addition, not
+ * part of the original acp/index.ts surface — deliberate widening. */
+export { listModels, retrieveModel } from "./models.ts"
+export type { ModelListOutcome, ModelRetrieveOutcome, ModelInfo } from "./models.ts"

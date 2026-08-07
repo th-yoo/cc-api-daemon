@@ -1,10 +1,13 @@
 # @th-yoo/cc-api-daemon
 
 Single-process `@anthropic-ai/sdk` twin of the kkamak ACP warm-lane client
-surface. Same six exports (`ensureDaemon`, `daemonCall`, `closeSession`,
-`DaemonOutcome`, `WarmIsolation`, `modelProvenBy`) and the same outcome
-semantics — but each `daemonCall` is exactly one Messages API call. No daemon
-process, no socket, no subprocess.
+surface. Same six exports as the original out-of-process ACP daemon
+(`ensureDaemon`, `daemonCall`, `closeSession`, `DaemonOutcome`,
+`WarmIsolation`, `modelProvenBy`) and the same outcome semantics — but each
+`daemonCall` is exactly one Messages API call. No daemon process, no socket,
+no subprocess. Two more exports, `listModels`/`retrieveModel`, cover
+read-only model metadata with a *separate*, non-spend outcome vocabulary —
+see "Model metadata" below.
 
 ## Install
 
@@ -81,6 +84,51 @@ exceptions). The OAuth lane sends `anthropic-beta: oauth-2025-04-20` with
   double-spend.
 - `maxRetries: 0` — exactly one HTTP call ever per `daemonCall`.
 
+This vocabulary is specific to `daemonCall`'s billed `messages.create` send —
+see "Model metadata" below for the separate, unbilled-GET outcome vocabulary
+used by `listModels`/`retrieveModel`.
+
+## Model metadata
+
+`listModels`/`retrieveModel` wrap the Anthropic Models API
+(`GET /v1/models`, `GET /v1/models/{id}`) — read-only, idempotent GETs, not
+billed model turns. Unlike `daemonCall`, there is no no-call/call-consumed
+double-spend concern here, so the outcome vocabulary names what actually
+happened instead:
+
+```ts
+import { listModels, retrieveModel } from "@th-yoo/cc-api-daemon"
+
+const list = await listModels(process.env)
+if (list.kind === "ok") {
+  for (const model of list.models) console.log(model.id, model.display_name)
+}
+
+const one = await retrieveModel("claude-opus-5", process.env)
+switch (one.kind) {
+  case "ok":
+    console.log(one.model.max_input_tokens, one.model.capabilities)
+    break
+  case "not-found":
+    // the model ID doesn't exist / isn't resolvable
+    break
+  case "no-auth":
+  case "error":
+    break
+}
+```
+
+- `ok` — `{ models: ModelInfo[] }` (list) or `{ model: ModelInfo }`
+  (retrieve). `ModelInfo` is re-exported verbatim from the SDK.
+- `no-auth` — no resolvable credentials; zero requests sent.
+- `not-found` — `retrieveModel` only: HTTP 404, the model ID doesn't resolve.
+- `error` — any other failure (HTTP error, timeout, network). Carries
+  optional `status`/`message` from the SDK's `APIError` when available.
+
+`listModels` drains every page into one flat array — there is no
+partial-success arm; a failure partway through a multi-page walk discards
+what was collected and returns `error`.
+
 ## Known limitations
 
 - `ensureDaemon`'s `waitMs` is accepted-and-ignored — there is nothing to
@@ -102,6 +150,12 @@ exceptions). The OAuth lane sends `anthropic-beta: oauth-2025-04-20` with
 - `budgetMs` bounds the HTTP phase only; keychain/file auth resolution runs
   before it with its own ~10s worst-case, so worst-case wall-clock is
   roughly `budgetMs + 10s`.
+- `listModels`'s `budgetMs` bounds each individual HTTP request in a
+  pagination walk, not the total time to drain all pages — a multi-page
+  catalog issues one request per page, each independently bounded.
+- `listModels`/`retrieveModel` don't expose the Models API's `betas`
+  parameter yet — add later as its own deliberate widening if a caller
+  needs a beta-gated model list.
 
 ## License
 
