@@ -1,46 +1,22 @@
-// Shared CLI-spawning stub helpers for gauge agent-sdk-transport tests.
-// Extracted from gauge-agent-transport.test.ts (Task 4 Step 0, DECLARED
-// EXCEPTION #4) so later test files (warm-session.test.ts, acp-wire.test.ts,
-// etc.) can reuse them without duplicating the credentials probe or the
-// SSE-shaped stub. NOT matched by bun's test glob — same as sdk-stub.ts.
-import fs from "node:fs"
-import os from "node:os"
-import path from "node:path"
-import { execFileSync } from "node:child_process"
+// Shared CLI-spawning stub helpers, ported from gauge-agent-transport.test.ts
+// (Task 4 Step 0, DECLARED EXCEPTION #4). NOT matched by bun's test glob —
+// same as sdk-stub.ts.
+//
+// Cleanup (CI-fix follow-up): this file used to also export
+// HAS_CLAUDE_CODE_CREDENTIALS / NO_CREDENTIALS_SKIP_REASON, a presence probe
+// that gated a `describe.skipIf`/`test.skipIf` in this package's own
+// gauge-agent-transport-style tests. Task 6 dropped every such skipIf (see
+// acp-client.test.ts's and acp-daemon.test.ts's own "Re-enabled" comments) —
+// this package never actually has gauge-agent-transport tests of its own;
+// the probe was carried over from the ported file's origin repo and nothing
+// here consumed it as a gate afterward. It kept firing anyway: an
+// unconditional `console.warn` on every credential-less run (which is every
+// CI run, since CI carries no ANTHROPIC_API_KEY/ANTHROPIC_AUTH_TOKEN and no
+// keychain) naming "gauge-agent-transport tests" that don't exist in this
+// repo — the first red herring anyone chasing a red CI run would hit.
+// Removed rather than left as dead-but-harmless: an unused export is inert,
+// a misleading warning on every run is not.
 import { stubServer } from "./sdk-stub.ts"
-
-// Fix-wave finding 4: every test that spawns the REAL bundled Claude Code CLI
-// (anything that calls agentSdkCall, directly or via deriveRecord's agent-sdk
-// route) needs on-disk Claude Code credentials for that spawned CLI to
-// authenticate with — this repo travels across hosts (WSL2 box, MacBook, CI)
-// and a host with no credentials must SKIP those tests loudly rather than
-// FAIL them (bun test gates merges; a credential-less host failing here is
-// not a real regression). Same credential source transport.ts's
-// `readAuthToken` checks (darwin keychain / linux ~/.claude/.credentials.json)
-// — this is a presence probe only, never reads or logs the token itself.
-function hasClaudeCodeCredentials(): boolean {
-  try {
-    if (process.platform === "darwin") {
-      execFileSync("security", ["find-generic-password", "-s", "Claude Code-credentials", "-w"], {
-        encoding: "utf-8",
-        timeout: 5000,
-      })
-      return true
-    }
-    return fs.existsSync(path.join(os.homedir(), ".claude", ".credentials.json"))
-  } catch {
-    return false
-  }
-}
-
-export const HAS_CLAUDE_CODE_CREDENTIALS = hasClaudeCodeCredentials()
-export const NO_CREDENTIALS_SKIP_REASON =
-  "no on-disk Claude Code credentials found (~/.claude/.credentials.json / macOS keychain) — " +
-  "CLI-spawning agentSdkCall tests require a credentialed host to authenticate the spawned CLI. " +
-  "The measurement host (a host WITH credentials present) MUST still run these, not skip them."
-if (!HAS_CLAUDE_CODE_CREDENTIALS) {
-  console.warn(`SKIPPING CLI-spawning gauge-agent-transport tests: ${NO_CREDENTIALS_SKIP_REASON}`)
-}
 
 // Wire-capture finding (2026-08-03): the CLI process the Agent SDK spawns
 // ALWAYS sends `stream: true` on /v1/messages — this is not toggled by any

@@ -14,3 +14,14 @@ jobs:
       - run: bun install --frozen-lockfile
       - run: bun test
       - run: bunx tsc --noEmit
+      # This repo is public; every log line here is public. This runner
+      # carries no ANTHROPIC_API_KEY/ANTHROPIC_AUTH_TOKEN today, so the step
+      # above already exercises the credential-less path — but that's
+      # incidental, not enforced, and would silently stop being true the
+      # day a real key is added to this workflow for some other reason. Run
+      # it explicitly so the invariant survives that: no test outcome may
+      # depend on host credentials. See CLAUDE.md "Credential safety".
+      - name: bun test (credentials explicitly scrubbed)
+        run: |
+          mkdir -p /tmp/no-creds
+          env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN HOME=/tmp/no-creds bun test

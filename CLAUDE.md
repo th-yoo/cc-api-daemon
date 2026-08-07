@@ -30,7 +30,78 @@ exports (`package.json` `exports["."]` → `src/index.ts`).
 - `bun run typecheck` (or `bunx tsc --noEmit`) — typecheck, no emit
 - `bun scripts/smoke.ts` — live smoke test, **real API spend (one haiku call)**; run deliberately, never in CI. Spawns/waits for a real daemon first (`ensureDaemon(env, { waitMs })`), then one real `daemonCall` round-trip.
 
-CI (`.github/workflows/ci.yml`) runs `bun test` then `bunx tsc --noEmit` on push/PR to `main`.
+CI (`.github/workflows/ci.yml`) runs `bun test`, `bunx tsc --noEmit`, then `bun test` again with credentials explicitly scrubbed, on push/PR to `main`.
+
+## Credential safety
+
+**This repo is public** (github.com/th-yoo/cc-api-daemon) — every CI log
+line is public. That is the threat model: a test that leaks a real
+credential into stdout/stderr, or that quietly depends on one being present
+to pass, exposes it to anyone who can read a GitHub Actions log. Everything
+below exists to make that structurally hard, not just discouraged.
+
+1. **The enforceable invariant**: `env -u ANTHROPIC_API_KEY -u
+   ANTHROPIC_AUTH_TOKEN HOME=/tmp/no-creds bun test` must pass — currently
+   187 pass / 0 fail. No test outcome may depend on host credentials. This
+   is the check that would have caught a real bug on its first commit
+   instead of three commits later: Task 6's two reenabled describe blocks
+   (`acp-client.test.ts`'s e2e test, `acp-daemon.test.ts`'s "reaches the
+   stubbed model" block) redirected `ANTHROPIC_BASE_URL` to a local stub but
+   never overrode the credential itself, so `resolveAuth` silently fell
+   through to whatever real credential the DEV HOST carried. It passed
+   locally for three commits (Task 6, 7, 8) before failing on the first
+   credential-less CI runner. Run the scrubbed command locally before
+   trusting a green `bun test` on any host that might have real credentials
+   lying around — CI also runs it as an explicit step (see below), but that
+   step existing doesn't excuse skipping the local check, since CI is the
+   *last* place you want to discover this.
+2. **CI runs the scrubbed command as its own step**
+   (`.github/workflows/ci.yml`, "bun test (credentials explicitly
+   scrubbed)"), not folded into the normal `bun test` step. The normal
+   `ubuntu-latest` step already happens to run credential-less today (no
+   `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN` secret is wired into this
+   workflow) — but that's incidental, not enforced, and would silently stop
+   being true the day a real key is added for some unrelated reason (a live
+   integration test, say). The explicit step keeps the invariant checked
+   regardless of what the workflow's secrets look like later.
+3. **Every test that spawns a real daemon or builds a real Anthropic client
+   must spread its own fake credential AFTER `...process.env`**, never
+   before, and never rely on `ANTHROPIC_BASE_URL` redirection alone.
+   Overriding only the URL still lets `resolveAuth` fall through to whatever
+   real credential the host ambiently carries — sends a REAL token to a
+   local stub (harmless: nothing reaches the real API) but is not what the
+   test claims to be testing, and inverts silently the moment the host has
+   no such credential. Use `test/helpers.ts`'s `stubEnv()`/`apiKeyEnv()`/
+   `oauthEnv()` where available; `test/acp-daemon.test.ts`'s `spawnDaemon()`
+   helper centralizes the injection for every daemon it spawns, so a new
+   test using it inherits the fix automatically. **Grepping for the
+   `ANTHROPIC_BASE_URL` literal to audit this undercounts**: `stubEnv()`
+   supplies both `ANTHROPIC_API_KEY` and `ANTHROPIC_BASE_URL` from inside
+   the helper, so a call site using it correctly has no `ANTHROPIC_BASE_URL`
+   literal of its own to find.
+4. **Never gate a test on host credential presence again** (no
+   `describe.skipIf(!hasCredentials)` or equivalent). That pattern is what
+   let the bug above ship in the first place, one layer removed: Task 1's
+   `HAS_CLAUDE_CODE_CREDENTIALS` gate (since deleted — it stopped gating
+   anything once Task 6 dropped the `skipIf`, but kept firing an
+   unconditional `console.warn` naming tests this package doesn't have, on
+   every credential-less run) hid a real dependency instead of removing it.
+   A `skipIf` on credentials doesn't make a test credential-independent, it
+   just stops running the test on the machine most likely to expose the
+   dependency (a fresh CI runner) — the dependency ships silently until
+   someone reads the actual failure. If a test genuinely needs live
+   credentials (nothing in this package currently does), it needs its own
+   clearly-named opt-in, not a silent skip.
+5. **Existing protections worth preserving, not weakening**: `envFingerprint`
+   (`acp-paths.ts`) redacts any env key matching `ACP_SECRET_KEY_RE =
+   /(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)/i` to `KEY=set` before hashing —
+   a credential's VALUE never enters the fingerprint, and the rule is
+   name-shaped so a new credential variable is covered the day it appears,
+   with no enum to keep in sync. `auth.ts` never logs a resolved token (zero
+   `console.*` calls in the file). The production daemon spawn
+   (`acp-client.ts`'s `spawnDaemonProcess`) runs with `stdout: "ignore",
+   stderr: "ignore"` — a daemon crash or stray log line never reaches a
+   parent process's output.
 
 ## Architecture
 
