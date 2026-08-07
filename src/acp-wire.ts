@@ -97,23 +97,33 @@ export const ACP_ERR_MODELS_UPSTREAM_ERROR = -32005
 /** Credential resolution (keychain exec / credentials-file read, auth.ts's
  * EXEC_TIMEOUT_MS) runs BEFORE the HTTP phase and carries its own 10s worst
  * case. A turn's timer starts at the PUSH, so the floor exists for the same
- * reason the CLI spawn floor did upstream (round-4 finding C3: a regression
+ * reason the CLI spawn floor does below (round-4 finding C3: a regression
  * test built on a too-small budget fails a CORRECT implementation
- * deterministically) — just a different pre-HTTP cost now that there is no
- * subprocess to boot. Replaces `CLI_SPAWN_BUDGET_MS` (8 000, sized for a
- * measured 1.25-1.46s CLI spawn that no longer happens on this backend). */
+ * deterministically) — a different pre-HTTP cost, on the ApiSession lane. */
 export const AUTH_RESOLVE_BUDGET_MS = 10_000
+
+/** WarmSession's own floor (restored — this process hosts both backends
+ * again, see the api-sdk merge brief's HAZARD 1): a `claude` CLI spawn is a
+ * measured 1.25-1.46s that happens INSIDE the turn window, so a
+ * `turnTimeoutMs` below this floor cannot distinguish "generation failed"
+ * from "the subprocess hadn't finished booting yet". `WarmSession.turnTimeoutMs`
+ * (ported in Task 2) clamps to `Math.max(CLI_SPAWN_BUDGET_MS, ACP_BUDGET.turnTimeoutMs)`.
+ * A process hosting both backends sizes its budgets off the SLOW one — both
+ * this floor and AUTH_RESOLVE_BUDGET_MS are live, one per backend. */
+export const CLI_SPAWN_BUDGET_MS = 8_000
 
 /** §6e budget rule. ONE object, in the module both sides import, because
  * `clientBudgetMs > daemonWorstCaseMs` is a CONTRACT: split these across two
  * files and a drift silently converts a `call-consumed` into a `no-call`,
  * i.e. two model calls for one record. Locked by acp-wire.test.ts.
  *
- * `clearTimeoutMs` and `setModelMs` are INERT on this backend (no `/clear`,
- * no `setModel` round-trip — the model is a per-request field, not session
- * state). They remain in the object because `WarmConstructOpts` names every
- * leg explicitly and the pool passes all of them; `ApiSession` (Task 4)
- * accepts and ignores these two, documented as such there.
+ * `clearTimeoutMs` and `setModelMs` are LIVE again (restored — see the
+ * api-sdk merge brief's HAZARD 1): `WarmSession` (Task 2) runs a `/clear`
+ * confirmation and a `setModel` round-trip on its CLI subprocess, so a
+ * process hosting both backends must size its worst-case sum off the SLOW
+ * one and count both legs. `ApiSession` accepts and ignores these two
+ * (no session state to clear, no setModel round-trip — the model is a
+ * per-request field), documented as such there.
  *
  * `minFallbackMs`/`recordBudgetMs` (kkamak CLIENT-side fallback-timing
  * policy, upstream) and `daemonLegMs` (this repo's OLD name for the client
@@ -128,24 +138,25 @@ export const AUTH_RESOLVE_BUDGET_MS = 10_000
 export const ACP_BUDGET = {
   /** daemon: a turn still queued at this point never reached execute() */
   queueWaitMs: 6_000,
-  /** daemon: inert on this backend — no `/clear`, no `conversation_reset` */
+  /** daemon: WarmSession's `/clear` confirmation round-trip */
   clearTimeoutMs: 4_000,
-  /** daemon: inert on this backend — no setModel round-trip */
+  /** daemon: WarmSession's setModel round-trip */
   setModelMs: 2_000,
-  /** daemon: generation budget, measured from the prompt push. MUST be
-   * >= AUTH_RESOLVE_BUDGET_MS — auth resolution happens inside this window. */
+  /** daemon: generation budget, measured from the prompt push. MUST clear
+   * the larger of AUTH_RESOLVE_BUDGET_MS (ApiSession lane) and
+   * CLI_SPAWN_BUDGET_MS (WarmSession lane) — both floors are live, one per
+   * backend, and this one turn budget is shared by both. */
   turnTimeoutMs: 16_000,
   /** daemon: grace before abandoning an aborted request */
   hardGraceMs: 4_000,
-  /** derived: 6 000 + 16 000 + 4 000 — the sum of the legs that actually
-   * survive on HTTP. The two inert legs (clearTimeoutMs, setModelMs)
-   * contribute nothing; the old five-leg sum (32 000) included them. */
-  daemonWorstCaseMs: 26_000,
+  /** derived: 6 000 + 4 000 + 2 000 + 16 000 + 4 000 — all five legs, since
+   * both backends share this process and the sum must cover the slow one. */
+  daemonWorstCaseMs: 32_000,
   /** client: MUST exceed daemonWorstCaseMs. The 4 000 ms of slack is the
    * connect + initialize + session/new preamble, which the daemon's own
    * per-turn clock does not cover. `daemonCall`'s default `budgetMs`
    * (acp-client.ts). */
-  clientBudgetMs: 30_000,
+  clientBudgetMs: 36_000,
 } as const
 
 /** §6e "Which field proves the model", the MATCHING rule — the single
