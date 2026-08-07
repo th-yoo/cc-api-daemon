@@ -20,10 +20,17 @@
  * former in-process credential-resolve-and-call. */
 export { ensureDaemon, daemonCall, closeSession, type DaemonOutcome } from "./acp-client.ts"
 
-/** The default backend the daemon runs when nothing else is injected.
- * Exported so a host can construct one directly, and so `makeSession`
- * injectors (see acp-pool.ts / acp-daemon.ts) have something to mirror. */
+/** Two default backends, routed by model (api-sdk merge brief HAZARD 3,
+ * routeBackend — src/route.ts, not exported: it is dispatch-internal
+ * policy, not part of this package's public contract). `ApiSession` is the
+ * per-session, never-pooled backend acp-daemon.ts constructs directly for
+ * `*haiku*` models (HAZARD 2); `WarmSession` is `SessionPool`'s own default
+ * backend (Task 5) for every other model, pooled because of its ~140MB
+ * private RSS per child. Both exported so a host can construct one
+ * directly, and so `makeSession`/`makeApiSession` injectors (acp-pool.ts /
+ * acp-daemon.ts) have something to mirror. */
 export { ApiSession } from "./api-session.ts"
+export { WarmSession } from "./warm-session.ts"
 
 /** Isolation is a VALUE that crosses the wire on session/new, not an id.
  * This package ships no isolation constant — that is caller-side policy. */

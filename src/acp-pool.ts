@@ -13,7 +13,7 @@
 //
 // node-n3c-ii-brief.md governs over the plan's S2 text where they differ.
 import { ACP_BUDGET, type WarmIsolation } from "./acp-wire.ts"
-import { ApiSession } from "./api-session.ts"
+import { WarmSession } from "./warm-session.ts"
 
 /** The minimal structural interface the pool needs off a warm session —
  * derived from actual pool usage (reap/quiescent/closeAll), so the
@@ -164,12 +164,16 @@ export class SessionPool {
 
   constructor(
     private readonly env: Record<string, string | undefined>,
-    // `makeSession` defaults to `ApiSession` (Task 5) — Task 1 left it
-    // required-with-no-default because no backend existed yet; now one
-    // does. A host wanting a different backend (e.g. meta-harness keeping
-    // its agent-SDK WarmSession) still injects one here, or via the
-    // daemon's own `makeSession` option, threaded straight through
-    // (acp-daemon.ts).
+    // `makeSession` defaults to `WarmSession` — the api-sdk merge brief's
+    // own Task 5 (this repo's ORIGINAL, now-superseded Task 5 made it
+    // ApiSession instead; see this file's header comment). The pool now
+    // exists only for the heavy (agent/CLI) lane: HAZARD 3's api-lane
+    // traffic (routeBackend === "api") is routed to a per-session
+    // ApiSession that bypasses the pool entirely (acp-daemon.ts, Task 4) —
+    // WarmSession is the only backend left that ever needs pooling
+    // (~140 MB private RSS per child, HAZARD 2). A host wanting a
+    // different backend still injects one here, or via the daemon's own
+    // `makeSession` option, threaded straight through (acp-daemon.ts).
     opts: {
       max?: number
       sessionIdleMs?: number
@@ -186,7 +190,7 @@ export class SessionPool {
     // the cap exists to prevent.
     this.max = opts.max !== undefined && Number.isFinite(opts.max) ? Math.max(1, Math.trunc(opts.max)) : parseMaxSessions(env)
     this.sessionIdleMs = opts.sessionIdleMs ?? DEFAULT_SESSION_IDLE_MS
-    this.makeSession = opts.makeSession ?? ((e, warmOpts) => new ApiSession(e, warmOpts))
+    this.makeSession = opts.makeSession ?? ((e, warmOpts) => new WarmSession(e, warmOpts))
   }
 
   /** Never queues, never blocks. An idle entry with DEEP-EQUAL isolation is

@@ -9,7 +9,7 @@
 import { describe, expect, test } from "bun:test"
 import { ACP_BUDGET, type WarmIsolation } from "../src/acp-wire.ts"
 import { SessionPool, type WarmConstructOpts, type WarmSessionLike } from "../src/acp-pool.ts"
-import { ApiSession } from "../src/api-session.ts"
+import { WarmSession } from "../src/warm-session.ts"
 
 // Two distinct fixture isolations for segregation tests — arbitrary
 // content, deliberately different from each other. Replaces the gauge's
@@ -456,15 +456,23 @@ describe("SessionPool.acquire — explicit makeSession budget legs", () => {
   })
 })
 
-// Task 5: the "no real backend" era from Task 1's header comment ends here —
-// ApiSession is now the pool's default when makeSession is omitted.
-describe("SessionPool — default backend (Task 5)", () => {
-  test("the pool builds ApiSessions by default", () => {
+// Task 5 (this repo's own original numbering) made ApiSession the pool's
+// default when makeSession is omitted. The api-sdk merge brief's OWN Task 5
+// flips it again: the pool now exists only for the heavy (agent/CLI) lane —
+// HAZARD 3's api-lane traffic is routed to a per-session ApiSession that
+// bypasses the pool entirely (acp-daemon.ts, Task 4) — so WarmSession is the
+// only backend the pool ever needs to construct by default now.
+// `toBeInstanceOf(WarmSession)` alone proves this without spawning
+// anything: WarmSession's constructor never calls ensure()/query() (see
+// warm-session.test.ts's own "construction only, no CLI spawn" block) — the
+// real subprocess only spawns on the first oneShot().
+describe("SessionPool — default backend (api-sdk merge brief Task 5)", () => {
+  test("the pool builds WarmSessions by default", () => {
     const pool = new SessionPool(ENV, { max: 1 })
     const got = pool.acquire(TEST_ISOLATION, Date.now())
     expect(got.ok).toBe(true)
     if (!got.ok) throw new Error("unreachable")
-    expect(got.entry.warm).toBeInstanceOf(ApiSession)
+    expect(got.entry.warm).toBeInstanceOf(WarmSession)
     pool.closeAll()
   })
 

@@ -1248,7 +1248,12 @@ describe("acp-daemon over unix socket (reaches the stubbed model)", () => {
   test("N3c-iii test 1: two sessions with DIFFERENT isolations never share a warm entry -- the marker system prompt appears ONLY on the marker-isolation session's captured request bodies", async () => {
     const e = tempEndpoint("isoseg"); LIVE.push(e)
     const CAPTURED: Array<Record<string, unknown>> = []
-    const cap = stubServer((c) => { CAPTURED.push(c.body); return okBody("ANSWER", STUB_DECLARED_MODEL) })
+    // AGENT_TEST_MODEL routes through the pool, whose default backend is now
+    // WarmSession (Task 5) -- a real CLI subprocess that always sends
+    // `stream:true`. sseText, not okBody: a non-streaming JSON body fails
+    // the CLI's own SSE parsing and makes it silently retry non-streaming,
+    // doubling CAPTURED (Task 2's own finding, agent-cli-stub.ts).
+    const cap = stubServer((c) => { CAPTURED.push(c.body); return sseText("ANSWER", STUB_DECLARED_MODEL) })
     try {
       const { env } = spawnDaemon(e.home, e.spawnLog, { ANTHROPIC_BASE_URL: cap.url })
       await waitForSpawnLog(e.spawnLog, 1, 15_000)
@@ -1285,7 +1290,8 @@ describe("acp-daemon over unix socket (reaches the stubbed model)", () => {
   test("a second SESSION recycles (clean context); a second PROMPT in one session does not", async () => {
     const e = tempEndpoint("recycle"); LIVE.push(e)
     const CAPTURED: Array<Record<string, unknown>> = []
-    const cap = stubServer((c) => { CAPTURED.push(c.body); return okBody("ANSWER", STUB_DECLARED_MODEL) })
+    // sseText, not okBody -- see the isolation-segregation test above.
+    const cap = stubServer((c) => { CAPTURED.push(c.body); return sseText("ANSWER", STUB_DECLARED_MODEL) })
     try {
       const { env } = spawnDaemon(e.home, e.spawnLog, { ANTHROPIC_BASE_URL: cap.url })
       await waitForSpawnLog(e.spawnLog, 1, 15_000)
@@ -1324,7 +1330,8 @@ describe("acp-daemon over unix socket (reaches the stubbed model)", () => {
   test("INTERLEAVED sessions each get a clean context (lastServedSessionId is committed at dispatch)", async () => {
     const e = tempEndpoint("interleave"); LIVE.push(e)
     const CAPTURED: Array<Record<string, unknown>> = []
-    const cap = stubServer((c) => { CAPTURED.push(c.body); return okBody("ANSWER", STUB_DECLARED_MODEL) })
+    // sseText, not okBody -- see the isolation-segregation test above.
+    const cap = stubServer((c) => { CAPTURED.push(c.body); return sseText("ANSWER", STUB_DECLARED_MODEL) })
     try {
       const { env } = spawnDaemon(e.home, e.spawnLog, { ANTHROPIC_BASE_URL: cap.url })
       await waitForSpawnLog(e.spawnLog, 1, 15_000)
