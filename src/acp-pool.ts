@@ -102,6 +102,16 @@ function parseMaxSessions(env: Record<string, string | undefined>): number {
  * factory), the exact divergence class the explicit-budgets rule (every leg
  * named here, never left to a caller's own defaulting) exists to prevent.
  *
+ * EXPORTED (api-sdk merge brief Task 4, HAZARD 2): the daemon's per-session
+ * `ApiSession` is deliberately NEVER pooled, so it cannot reuse the pool's
+ * OWN `WarmConstructOpts` construction — but the knob itself
+ * (`KKAMAK_ACP_TURN_TIMEOUT_MS`) is an instrument-wide setting, not a
+ * pool-specific one, so `acp-daemon.ts` reuses this exact function for its
+ * own unpooled construction rather than re-deriving the same env-parsing
+ * rule a second time. This is the ONE function shared between the two
+ * construction sites, not a second authority — the divergence class this
+ * comment's second paragraph warns against.
+ *
  * Mirrors acp-daemon.ts's (now-removed) `warmBudgetOpts` EXACTLY,
  * byte-for-byte in behavior, not `parseMaxSessions`'s stricter
  * finite-then-clamp rule: `Number(raw) || ACP_BUDGET.turnTimeoutMs`. Unset,
@@ -113,7 +123,7 @@ function parseMaxSessions(env: Record<string, string | undefined>): number {
  * already owns that floor (`Math.max(CLI_SPAWN_BUDGET_MS, ...)`), so
  * re-validating here would be a second, potentially divergent authority
  * on the exact same floor. */
-function parseTurnTimeoutMs(env: Record<string, string | undefined>): number {
+export function parseTurnTimeoutMs(env: Record<string, string | undefined>): number {
   return Number(env.KKAMAK_ACP_TURN_TIMEOUT_MS) || ACP_BUDGET.turnTimeoutMs
 }
 

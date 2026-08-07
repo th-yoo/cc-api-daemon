@@ -73,7 +73,9 @@ import fs from "node:fs"
 import crypto from "node:crypto"
 import { WebSocketServer, type WebSocket as WsConnection } from "ws"
 import type { TurnOutcome, DispatchableSession } from "./session-contract.ts"
-import { SessionPool, type WarmConstructOpts } from "./acp-pool.ts"
+import { SessionPool, type WarmConstructOpts, parseTurnTimeoutMs } from "./acp-pool.ts"
+import { ApiSession } from "./api-session.ts"
+import { routeBackend } from "./route.ts"
 import {
   discoveryPath, writeDiscovery, readDiscovery, wsUrl, bindLockPath, envFingerprint,
   acquireAcpLock, releaseAcpLock,
@@ -113,7 +115,12 @@ type Write = (msg: object) => void
  * acp-daemon.test.ts's own `fakeWarmSession` cast to the concrete class. */
 
 export interface DaemonState {
-  sessions: Map<string, { createdAt: number; isolation: WarmIsolation }>
+  /** `apiSession` (HAZARD 2, api-sdk merge brief): a per-session `ApiSession`
+   * is minted lazily on that session's FIRST api-lane (`*haiku*`) prompt and
+   * held here — NEVER pooled, NEVER shared across sessions. Absent for a
+   * session that has only ever taken the agent (pool) lane, or hasn't
+   * prompted at all yet. */
+  sessions: Map<string, { createdAt: number; isolation: WarmIsolation; apiSession?: DispatchableSession }>
   /** sessionId -> the ordered (oldest-first) list of {tag, warm} pairs for
    * that session's turns CURRENTLY outstanding (queued or in flight).
    * Round-2 review finding 1 (2026-08-05): a single Map<sessionId, tag>
@@ -205,6 +212,17 @@ function readSessionId(params: unknown): string | undefined {
   return typeof s === "string" && s.length > 0 ? s : undefined
 }
 
+/** HAZARD 2: per-session ApiSessions are never pooled, so `pool.quiescent()`
+ * cannot see them — the daemon-level self-exit gate (below) and shutdown()
+ * both need their OWN check across `state.sessions` for a turn in flight on
+ * that lane. */
+function anyApiSessionBusy(state: DaemonState): boolean {
+  for (const s of state.sessions.values()) {
+    if (s.apiSession?.turnInFlight()) return true
+  }
+  return false
+}
+
 function readPromptText(params: unknown): string {
   const prompt = (params as { prompt?: Array<{ text?: unknown }> } | undefined)?.prompt
   if (!Array.isArray(prompt)) return ""
@@ -232,7 +250,14 @@ export function createDispatcher(
   state: DaemonState,
   fingerprint: string,
   env: Record<string, string | undefined>,
+  // `makeApiSession` (HAZARD 2, api-sdk merge brief): the api lane's own DI
+  // seam, mirroring the pool's own `makeSession` (acp-pool.ts) — a fake here
+  // lets dispatcher-level tests prove the ROUTING decision and the
+  // never-pooled reuse-per-session contract without a real daemon process or
+  // network. Defaults to the real `ApiSession`.
+  opts?: { makeApiSession?: (env: Record<string, string | undefined>, warmOpts: WarmConstructOpts) => DispatchableSession },
 ) {
+  const makeApiSession = opts?.makeApiSession ?? ((e, warmOpts) => new ApiSession(e, warmOpts))
   return async function handle(frame: unknown, write: Write): Promise<void> {
     const req = frame as { id?: number | string; method?: unknown; params?: unknown }
     const id = req.id
@@ -263,6 +288,37 @@ export function createDispatcher(
     // unsent, so the fallback must not claim callConsumed:false and risk
     // a caller retrying an already-billed turn.
     let mayHaveConsumed = false
+
+    // HAZARD 3/api-sdk merge brief Task 4: the ok/no-call/call-consumed
+    // response shape is IDENTICAL for both backends (§6e's outcome law is
+    // backend-agnostic) — factored into ONE helper so the agent (pool) and
+    // api (per-session) branches below cannot drift from each other.
+    const respondOutcome = (outcome: TurnOutcome, sessionId: string): void => {
+      if (outcome.kind === "ok") {
+        // ONE session/update notification carrying the full text, THEN the
+        // result — never the other order, or a client racing on the result
+        // could miss the chunk.
+        write({
+          jsonrpc: "2.0",
+          method: ACP_SESSION_UPDATE,
+          params: {
+            sessionId,
+            update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: outcome.text } },
+          },
+        })
+        respond({
+          stopReason: "end_turn",
+          _meta: { kkamak: { model: outcome.model, canonicalModel: outcome.canonicalModel, callConsumed: true } },
+        })
+        return
+      }
+      if (outcome.kind === "no-call") {
+        respondError(ACP_ERR_NO_CALL, "no model call was made", { callConsumed: false })
+        return
+      }
+      // outcome.kind === "call-consumed"
+      respondError(ACP_ERR_CALL_CONSUMED, "a model call was made but the turn did not complete", { callConsumed: true })
+    }
 
     try {
       switch (method) {
@@ -323,6 +379,53 @@ export function createDispatcher(
           }
           const text = readPromptText(params)
 
+          // HAZARD 3 (api-sdk merge brief): route by model, not preference.
+          // *haiku* -> the api (bare-SDK) lane; everything else, including
+          // any unrecognized model, defaults to agent (the CLI lane serves
+          // every model measured 429 on bare-SDK) — degrading to "heavier
+          // than necessary" is safe, degrading to a 429 is not.
+          if (routeBackend(model) === "api") {
+            // HAZARD 2: NEVER pooled. One ApiSession per ACP session, minted
+            // lazily on this session's first api-lane prompt and held on the
+            // session record; a later prompt on the SAME session (even a
+            // later agent-lane one) reuses it unchanged.
+            let apiSession = session.apiSession
+            if (!apiSession) {
+              apiSession = makeApiSession(env, {
+                isolation: session.isolation,
+                turnTimeoutMs: parseTurnTimeoutMs(env),
+                queueWaitMs: ACP_BUDGET.queueWaitMs,
+                clearTimeoutMs: ACP_BUDGET.clearTimeoutMs,
+                setModelMs: ACP_BUDGET.setModelMs,
+                hardGraceMs: ACP_BUDGET.hardGraceMs,
+              })
+              session.apiSession = apiSession
+            }
+            // Never recycle: this instance is EXCLUSIVE to this session (no
+            // other caller can ever reuse it, unlike a pool entry), so a
+            // second prompt on the same session should keep growing its own
+            // context, same as a pool entry picking up its OWN prior
+            // session (see the agent branch's `lastSessionForEntry` comment
+            // below for the pool's equivalent reasoning).
+            const tag = crypto.randomUUID()
+            const outstandingForSession = state.outstanding.get(sessionId) ?? []
+            outstandingForSession.push({ tag, warm: apiSession })
+            state.outstanding.set(sessionId, outstandingForSession)
+            mayHaveConsumed = true
+            try {
+              const outcome: TurnOutcome = await apiSession.oneShot(text, model, { recycle: false, tag })
+              respondOutcome(outcome, sessionId)
+              return
+            } finally {
+              const remaining = state.outstanding.get(sessionId)
+              if (remaining) {
+                const i = remaining.findIndex((o) => o.tag === tag)
+                if (i >= 0) remaining.splice(i, 1)
+                if (remaining.length === 0) state.outstanding.delete(sessionId)
+              }
+            }
+          }
+
           const acquired = pool.acquire(session.isolation, Date.now())
           if (!acquired.ok) {
             // Pool exhaustion: NOTHING was sent to any warm entry, so this
@@ -368,30 +471,7 @@ export function createDispatcher(
           mayHaveConsumed = true
           try {
             const outcome: TurnOutcome = await warm.oneShot(text, model, { recycle, tag })
-            if (outcome.kind === "ok") {
-              // ONE session/update notification carrying the full text,
-              // THEN the result — never the other order, or a client
-              // racing on the result could miss the chunk.
-              write({
-                jsonrpc: "2.0",
-                method: ACP_SESSION_UPDATE,
-                params: {
-                  sessionId,
-                  update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: outcome.text } },
-                },
-              })
-              respond({
-                stopReason: "end_turn",
-                _meta: { kkamak: { model: outcome.model, canonicalModel: outcome.canonicalModel, callConsumed: true } },
-              })
-              return
-            }
-            if (outcome.kind === "no-call") {
-              respondError(ACP_ERR_NO_CALL, "no model call was made", { callConsumed: false })
-              return
-            }
-            // outcome.kind === "call-consumed"
-            respondError(ACP_ERR_CALL_CONSUMED, "a model call was made but the turn did not complete", { callConsumed: true })
+            respondOutcome(outcome, sessionId)
             return
           } finally {
             // Release the entry back to the pool on EVERY path through this
@@ -444,13 +524,36 @@ export function createDispatcher(
           // same law as session/cancel's own ack: ALWAYS a response, never
           // an error frame.
           const sessionId = readSessionId(params)
+          const session = sessionId ? state.sessions.get(sessionId) : undefined
+          if (!session) {
+            respond({ closed: false, reason: "unknown-session" })
+            return
+          }
+
+          // HAZARD 2: the per-session ApiSession is never pooled, so it
+          // needs its OWN close path here — refusing (never erroring, same
+          // "always a response" law) while a turn is still in flight, the
+          // same guard shape as the pool's own closeEntry busy/turn-in-
+          // flight refusal.
+          if (session.apiSession?.turnInFlight()) {
+            respond({ closed: false, reason: "turn-in-flight" })
+            return
+          }
+          if (session.apiSession) {
+            session.apiSession.close()
+            session.apiSession = undefined
+          }
+
           let entryId: string | undefined
           for (const [eid, sid] of state.lastServedBySessionForEntry) {
             if (sid === sessionId) { entryId = eid; break }
           }
-          const result = entryId === undefined
-            ? { closed: false, reason: "unknown-session" }
-            : pool.closeEntry(entryId)
+          // A known session with no pool entry to its name (api-lane only,
+          // or never prompted at all) has nothing further to close — unlike
+          // the pre-HAZARD-2 version of this code, `entryId === undefined`
+          // no longer implies "unknown session": `state.sessions` is
+          // consulted directly now (above), so that ambiguity is gone.
+          const result = entryId === undefined ? { closed: true } : pool.closeEntry(entryId)
           if (result.closed && entryId !== undefined) {
             state.lastServedBySessionForEntry.delete(entryId)
           }
@@ -581,7 +684,10 @@ async function bindWithTakeover(
 
 async function runServer(
   env: Record<string, string | undefined>,
-  opts?: { makeSession?: (env: Record<string, string | undefined>, warmOpts: WarmConstructOpts) => DispatchableSession },
+  opts?: {
+    makeSession?: (env: Record<string, string | undefined>, warmOpts: WarmConstructOpts) => DispatchableSession
+    makeApiSession?: (env: Record<string, string | undefined>, warmOpts: WarmConstructOpts) => DispatchableSession
+  },
 ): Promise<void> {
   const bindLock = bindLockPath(env)
   const fingerprint = envFingerprint(env)
@@ -600,7 +706,7 @@ async function runServer(
   // No makeSession override -> the pool's own default (ApiSession, Task 5).
   const pool = new SessionPool(env, opts?.makeSession ? { makeSession: opts.makeSession } : {})
   const state = createDaemonState()
-  const dispatch = createDispatcher(pool, state, fingerprint, env)
+  const dispatch = createDispatcher(pool, state, fingerprint, env, { makeApiSession: opts?.makeApiSession })
   const clients = new Set<WsConnection>()
   // Daemon-level activity clock (N3c-iii): the single WarmSession's own
   // `idleMs()` gate no longer exists — a pool can hold several entries, each
@@ -723,6 +829,10 @@ async function runServer(
     server.close()
     for (const ws of clients) { try { ws.terminate() } catch { /* ignore */ } }
     pool.closeAll()
+    // HAZARD 2: per-session ApiSessions are never in `pool` at all —
+    // shutdown must close them directly, same "close busy ones too, that's
+    // expected at shutdown" contract as `pool.closeAll()` above.
+    for (const s of state.sessions.values()) { s.apiSession?.close() }
     // Review finding: `acquireAcpLock` is not "never throws" — a rethrown
     // non-EEXIST error (e.g. EACCES on the lock dir) must not skip
     // `process.exit` below and become an unhandled rejection. Wrapping the
@@ -747,9 +857,12 @@ async function runServer(
     // Evict idle POOL ENTRIES first (same cadence, the pool's own idle
     // budget), THEN decide whether the whole DAEMON should self-exit — same
     // drain order as before (idle work, then self-exit gate), just with
-    // `pool.quiescent()` replacing the single `!warm.turnInFlight()`.
+    // `pool.quiescent()` replacing the single `!warm.turnInFlight()`. HAZARD
+    // 2: `pool.quiescent()` alone cannot see a per-session ApiSession's turn
+    // (never pooled) — `anyApiSessionBusy` is the same ground-truth check
+    // for that lane, so self-exit never lands mid an api-lane turn.
     pool.reap(Date.now())
-    if (Date.now() - lastActivityAt > idleMs && pool.quiescent()) void shutdown(0)
+    if (Date.now() - lastActivityAt > idleMs && pool.quiescent() && !anyApiSessionBusy(state)) void shutdown(0)
   }, tickMs)
 
   process.on("SIGTERM", () => void shutdown(0))
@@ -762,13 +875,16 @@ async function runServer(
  * (EOF) tears the session down directly. */
 async function runStdio(
   env: Record<string, string | undefined>,
-  opts?: { makeSession?: (env: Record<string, string | undefined>, warmOpts: WarmConstructOpts) => DispatchableSession },
+  opts?: {
+    makeSession?: (env: Record<string, string | undefined>, warmOpts: WarmConstructOpts) => DispatchableSession
+    makeApiSession?: (env: Record<string, string | undefined>, warmOpts: WarmConstructOpts) => DispatchableSession
+  },
 ): Promise<void> {
   const fingerprint = envFingerprint(env)
   // No makeSession override -> the pool's own default (ApiSession, Task 5).
   const pool = new SessionPool(env, opts?.makeSession ? { makeSession: opts.makeSession } : {})
   const state = createDaemonState()
-  const dispatch = createDispatcher(pool, state, fingerprint, env)
+  const dispatch = createDispatcher(pool, state, fingerprint, env, { makeApiSession: opts?.makeApiSession })
   const decoder = new FrameDecoder()
   const write: Write = (msg) => {
     try { process.stdout.write(encodeFrame(msg)) } catch { /* peer gone (e.g. EPIPE) */ }
@@ -780,6 +896,8 @@ async function runStdio(
   })
   process.stdin.on("end", () => {
     pool.closeAll()
+    // HAZARD 2: per-session ApiSessions are never in `pool`.
+    for (const s of state.sessions.values()) { s.apiSession?.close() }
     process.exit(0)
   })
 }

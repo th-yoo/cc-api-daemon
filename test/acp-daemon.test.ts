@@ -63,7 +63,7 @@ import {
 import { envFingerprint, readDiscovery, writeDiscovery, wsUrl } from "../src/acp-paths.ts"
 import { createDaemonState, createDispatcher } from "../src/acp-daemon.ts"
 import { SessionPool, type WarmSessionLike, type WarmConstructOpts } from "../src/acp-pool.ts"
-import type { TurnOutcome, CancelResult } from "../src/session-contract.ts"
+import type { TurnOutcome, CancelResult, DispatchableSession } from "../src/session-contract.ts"
 
 // Replaces the gauge's own TEST_ISOLATION/TEST_ISOLATION_2 constants,
 // which were caller-side and this general ACP package no longer ships
@@ -104,6 +104,16 @@ const MARKER_ISOLATION: WarmIsolation = {
 
 const DAEMON_TEST_TIMEOUT_MS = 60_000
 const HAIKU = "claude-haiku-4-5"
+// api-sdk merge brief HAZARD 3: routeBackend sends *haiku* to the api lane
+// (per-session ApiSession, never pooled) and everything else to the agent
+// lane (SessionPool). Tests below that exercise POOL mechanics specifically
+// (entry sharing/segregation, recycle-on-reuse, pool exhaustion, dispatch
+// races) use this constant instead of HAIKU, so they keep exercising the
+// pool regardless of which backend SessionPool defaults to — Task 5 flips
+// that default from ApiSession to WarmSession, and these tests' local JSON
+// stub fixtures (okBody/stubServer) will need converting to the CLI lane's
+// SSE shape at that point (see this repo's own status report for the note).
+const AGENT_TEST_MODEL = "claude-sonnet-5"
 // STUB_DECLARED_MODEL is what the stub puts in its response body's `model`
 // field. Reality-check (Task 6): the original T4·1a split here assumed
 // modelUsage is keyed by the client-requested ALIAS regardless of what the
@@ -637,6 +647,186 @@ function fakeDispatchPool() {
   }
 }
 
+/** Task 4 (api-sdk merge brief) — HAZARD 2's fake-side twin of
+ * `FakeDispatchWarm`: the per-session, NEVER-POOLED api-lane backend.
+ * Implements `DispatchableSession` in full (not just `WarmSessionLike`),
+ * since `createDispatcher`'s api branch calls `oneShot`/`cancel` on it
+ * directly, the same way it does on a pool entry's `warm`. */
+class FakeDispatchApi implements DispatchableSession {
+  readonly isolation: WarmIsolation
+  private inflight = new Map<string, (o: TurnOutcome) => void>()
+  constructor(private readonly calls: string[], isolation: WarmIsolation) { this.isolation = isolation }
+  turnInFlight(): boolean { return this.inflight.size > 0 }
+  close(): void { this.calls.push("close") }
+  oneShot(_text: string, _model: string, opts: { recycle: boolean; tag?: string }): Promise<TurnOutcome> {
+    const tag = opts.tag!
+    this.calls.push(`oneShot:${tag}`)
+    return new Promise<TurnOutcome>((resolve) => { this.inflight.set(tag, resolve) })
+  }
+  cancel(tag: string): CancelResult {
+    this.calls.push(`cancel:${tag}`)
+    const resolve = this.inflight.get(tag)
+    if (resolve) { this.inflight.delete(tag); resolve({ kind: "no-call" }); return "queued-dropped" }
+    return "unknown"
+  }
+  trySettle(tag: string, outcome: TurnOutcome): boolean {
+    const resolve = this.inflight.get(tag)
+    if (!resolve) return false
+    this.inflight.delete(tag)
+    resolve(outcome)
+    return true
+  }
+}
+
+/** A fresh `FakeDispatchApi` per `makeApiSession(...)` call, sharing one
+ * `calls` log — mirrors `fakeDispatchPool()`'s own convention. HAZARD 2
+ * means `makeApiSession` should be called AT MOST ONCE per ACP session
+ * (never per-turn, never pooled), which is exactly what
+ * `instances.length` proves in the tests below. */
+function fakeApiFactory() {
+  const calls: string[] = []
+  const instances: FakeDispatchApi[] = []
+  const makeApiSession = (_env: Record<string, string | undefined>, opts: WarmConstructOpts) => {
+    const a = new FakeDispatchApi(calls, opts.isolation)
+    instances.push(a)
+    return a
+  }
+  return {
+    makeApiSession,
+    calls,
+    instances,
+    settle(tag: string, outcome: TurnOutcome) {
+      for (const a of instances) if (a.trySettle(tag, outcome)) return
+      throw new Error(`settle: no in-flight turn for tag ${tag}`)
+    },
+  }
+}
+
+// ── HAZARD 2/3 (api-sdk merge brief): routing + the per-session,
+// never-pooled api backend. Fake pool AND fake api factory, no daemon
+// process, no network — proves the DISPATCH decision itself, which the
+// real-daemon "reaches the stubbed model" suite (further below) cannot: a
+// live daemon's pool is a real SessionPool, opaque from the wire.
+describe("acp-daemon dispatcher — HAZARD 2/3 routing (fake pool + fake api factory)", () => {
+  test("a haiku model bypasses the pool entirely and uses the api factory (HAZARD 3)", async () => {
+    const { pool, calls: poolCalls } = fakeDispatchPool()
+    const { makeApiSession, calls: apiCalls, instances, settle } = fakeApiFactory()
+    const state = createDaemonState()
+    const S = "s-haiku"
+    state.sessions.set(S, { createdAt: Date.now(), isolation: TEST_ISOLATION })
+    const dispatch = createDispatcher(pool, state, "fp", {}, { makeApiSession })
+    const frames: Array<Record<string, unknown>> = []
+    const write = (m: object) => frames.push(m as Record<string, unknown>)
+
+    const p = dispatch({ id: 1, method: "session/prompt", params: {
+      sessionId: S, prompt: [{ type: "text", text: "hi" }], _meta: { kkamak: { model: HAIKU } },
+    } }, write)
+    const tag = apiCalls.find((c) => c.startsWith("oneShot:"))!.split(":")[1]!
+    expect(poolCalls.filter((c) => c.startsWith("oneShot:")).length).toBe(0)   // pool never touched
+    expect(pool.size()).toBe(0)
+    settle(tag, { kind: "ok", text: "ANSWER", model: HAIKU, canonicalModel: HAIKU })
+    await p
+    expect(frames.find((f) => f.id === 1)).toMatchObject({
+      result: { stopReason: "end_turn", _meta: { kkamak: { model: HAIKU, canonicalModel: HAIKU, callConsumed: true } } },
+    })
+    expect(instances.length).toBe(1)
+  })
+
+  test("a non-haiku model still routes through the pool (agent lane), api factory never called", async () => {
+    const { pool, calls: poolCalls, settle } = fakeDispatchPool()
+    const { makeApiSession, calls: apiCalls } = fakeApiFactory()
+    const state = createDaemonState()
+    const S = "s-agent"
+    state.sessions.set(S, { createdAt: Date.now(), isolation: TEST_ISOLATION })
+    const dispatch = createDispatcher(pool, state, "fp", {}, { makeApiSession })
+    const frames: Array<Record<string, unknown>> = []
+    const write = (m: object) => frames.push(m as Record<string, unknown>)
+
+    const p = dispatch({ id: 1, method: "session/prompt", params: {
+      sessionId: S, prompt: [{ type: "text", text: "hi" }], _meta: { kkamak: { model: AGENT_TEST_MODEL } },
+    } }, write)
+    const oneShotCalls = poolCalls.filter((c) => c.startsWith("oneShot:"))
+    expect(oneShotCalls.length).toBe(1)
+    expect(apiCalls.length).toBe(0)
+    settle(oneShotCalls[0]!.split(":")[1]!, { kind: "no-call" })
+    await p
+  })
+
+  test("two prompts in the SAME session reuse the SAME per-session api backend — never a fresh one per turn (HAZARD 2)", async () => {
+    const { pool } = fakeDispatchPool()
+    const { makeApiSession, calls: apiCalls, instances, settle } = fakeApiFactory()
+    const state = createDaemonState()
+    const S = "s-reuse"
+    state.sessions.set(S, { createdAt: Date.now(), isolation: TEST_ISOLATION })
+    const dispatch = createDispatcher(pool, state, "fp", {}, { makeApiSession })
+    const write = () => {}
+
+    const p1 = dispatch({ id: 1, method: "session/prompt", params: {
+      sessionId: S, prompt: [{ type: "text", text: "one" }], _meta: { kkamak: { model: HAIKU } },
+    } }, write)
+    const tag1 = apiCalls.find((c) => c.startsWith("oneShot:"))!.split(":")[1]!
+    settle(tag1, { kind: "no-call" })
+    await p1
+    expect(instances.length).toBe(1)
+
+    const p2 = dispatch({ id: 2, method: "session/prompt", params: {
+      sessionId: S, prompt: [{ type: "text", text: "two" }], _meta: { kkamak: { model: HAIKU } },
+    } }, write)
+    const oneShots = apiCalls.filter((c) => c.startsWith("oneShot:"))
+    expect(oneShots.length).toBe(2)
+    settle(oneShots[1]!.split(":")[1]!, { kind: "no-call" })
+    await p2
+    expect(instances.length).toBe(1)   // STILL one instance -- never re-minted per turn
+  })
+
+  test("session/close closes a per-session api backend directly, never touching the pool (HAZARD 2)", async () => {
+    const { pool } = fakeDispatchPool()
+    const { makeApiSession, calls: apiCalls, settle } = fakeApiFactory()
+    const state = createDaemonState()
+    const S = "s-close"
+    state.sessions.set(S, { createdAt: Date.now(), isolation: TEST_ISOLATION })
+    const dispatch = createDispatcher(pool, state, "fp", {}, { makeApiSession })
+    const frames: Array<Record<string, unknown>> = []
+    const write = (m: object) => frames.push(m as Record<string, unknown>)
+
+    const p1 = dispatch({ id: 1, method: "session/prompt", params: {
+      sessionId: S, prompt: [{ type: "text", text: "one" }], _meta: { kkamak: { model: HAIKU } },
+    } }, write)
+    const tag = apiCalls.find((c) => c.startsWith("oneShot:"))!.split(":")[1]!
+    settle(tag, { kind: "no-call" })
+    await p1
+
+    await dispatch({ id: 2, method: "session/close", params: { sessionId: S } }, write)
+    expect(frames.find((f) => f.id === 2)).toMatchObject({ result: { closed: true } })
+    expect(apiCalls).toContain("close")
+    expect(pool.size()).toBe(0)
+  })
+
+  test("session/close refuses while the api backend has a turn in flight — closed:false turn-in-flight", async () => {
+    const { pool } = fakeDispatchPool()
+    const { makeApiSession, calls: apiCalls } = fakeApiFactory()
+    const state = createDaemonState()
+    const S = "s-close-busy"
+    state.sessions.set(S, { createdAt: Date.now(), isolation: TEST_ISOLATION })
+    const dispatch = createDispatcher(pool, state, "fp", {}, { makeApiSession })
+    const frames: Array<Record<string, unknown>> = []
+    const write = (m: object) => frames.push(m as Record<string, unknown>)
+
+    const p1 = dispatch({ id: 1, method: "session/prompt", params: {
+      sessionId: S, prompt: [{ type: "text", text: "hangs" }], _meta: { kkamak: { model: HAIKU } },
+    } }, write)
+    expect(apiCalls.filter((c) => c.startsWith("oneShot:")).length).toBe(1)
+
+    await dispatch({ id: 2, method: "session/close", params: { sessionId: S } }, write)
+    expect(frames.find((f) => f.id === 2)).toMatchObject({ result: { closed: false, reason: "turn-in-flight" } })
+    expect(apiCalls).not.toContain("close")
+
+    // Clean up.
+    await dispatch({ id: 3, method: "session/cancel", params: { sessionId: S } }, write)
+    await p1
+  })
+})
+
 describe("acp-daemon dispatcher — outstanding-tag bookkeeping (fake SessionPool, no daemon process)", () => {
   test("two same-session prompts in flight: cancel targets the OLDEST tag, and neither turn's cleanup wipes the other's entry", async () => {
     const { pool, calls } = fakeDispatchPool()
@@ -957,6 +1147,28 @@ describe("acp-daemon dispatcher — session/close", () => {
     expect(frames[0]).toMatchObject({ result: { closed: false, reason: "unknown-session" } })
   })
 
+  // Task 4 (api-sdk merge brief), deliberate refinement: the OLD close logic
+  // checked ONLY `state.lastServedBySessionForEntry` (a pool-entry reverse
+  // lookup) and never consulted `state.sessions` at all, so a REGISTERED
+  // session that simply never prompted got the same "unknown-session"
+  // reason as one that was never registered — a pre-existing misnomer, only
+  // exposed now that HAZARD 2 requires `state.sessions` to be consulted
+  // directly (to find a per-session ApiSession). A known session with
+  // nothing to close responds `closed:true` (nothing to do, same as
+  // `session/cancel`'s own no-op ack), reserving `unknown-session`
+  // specifically for a sessionId this daemon never registered.
+  test("session/close for a REGISTERED session that never prompted responds closed:true, not unknown-session", async () => {
+    const { pool } = fakeDispatchPool()
+    const state = createDaemonState()
+    state.sessions.set("registered-but-idle", { createdAt: Date.now(), isolation: TEST_ISOLATION })
+    const dispatch = createDispatcher(pool, state, "fp", {})
+    const frames: Array<Record<string, unknown>> = []
+    const write = (m: object) => frames.push(m as Record<string, unknown>)
+
+    await dispatch({ id: 1, method: "session/close", params: { sessionId: "registered-but-idle" } }, write)
+    expect(frames[0]).toMatchObject({ result: { closed: true } })
+  })
+
   test("session/close while the entry is busy responds closed:false busy (pool guard)", async () => {
     const { pool, calls } = fakeDispatchPool()
     const state = createDaemonState()
@@ -1048,7 +1260,7 @@ describe("acp-daemon over unix socket (reaches the stubbed model)", () => {
       })
       await c.request("session/prompt", {
         sessionId: sGauge.sessionId, prompt: [{ type: "text", text: "gauge turn" }],
-        _meta: { kkamak: { model: HAIKU } },
+        _meta: { kkamak: { model: AGENT_TEST_MODEL } },
       })
 
       const sMarker = await c.request("session/new", {
@@ -1056,7 +1268,7 @@ describe("acp-daemon over unix socket (reaches the stubbed model)", () => {
       })
       await c.request("session/prompt", {
         sessionId: sMarker.sessionId, prompt: [{ type: "text", text: "marker turn" }],
-        _meta: { kkamak: { model: HAIKU } },
+        _meta: { kkamak: { model: AGENT_TEST_MODEL } },
       })
 
       expect(CAPTURED.length).toBe(2)
@@ -1083,13 +1295,13 @@ describe("acp-daemon over unix socket (reaches the stubbed model)", () => {
       const s1 = await c.request("session/new", { cwd: process.cwd(), mcpServers: [], _meta: { kkamak: { isolation: TEST_ISOLATION } } })
       await c.request("session/prompt", {
         sessionId: s1.sessionId, prompt: [{ type: "text", text: "FIRST-MARKER" }],
-        _meta: { kkamak: { model: HAIKU } },
+        _meta: { kkamak: { model: AGENT_TEST_MODEL } },
       })
 
       const s2 = await c.request("session/new", { cwd: process.cwd(), mcpServers: [], _meta: { kkamak: { isolation: TEST_ISOLATION } } })
       await c.request("session/prompt", {
         sessionId: s2.sessionId, prompt: [{ type: "text", text: "SECOND-MARKER" }],
-        _meta: { kkamak: { model: HAIKU } },
+        _meta: { kkamak: { model: AGENT_TEST_MODEL } },
       })
       expect(CAPTURED.length).toBe(2)
       const m2 = CAPTURED[1] as { messages: unknown[] }
@@ -1100,7 +1312,7 @@ describe("acp-daemon over unix socket (reaches the stubbed model)", () => {
       // cleared, so the second prompt's marker is still present.
       await c.request("session/prompt", {
         sessionId: s2.sessionId, prompt: [{ type: "text", text: "THIRD-MARKER" }],
-        _meta: { kkamak: { model: HAIKU } },
+        _meta: { kkamak: { model: AGENT_TEST_MODEL } },
       })
       expect(CAPTURED.length).toBe(3)
       const m3 = CAPTURED[2] as { messages: unknown[] }
@@ -1137,15 +1349,15 @@ describe("acp-daemon over unix socket (reaches the stubbed model)", () => {
       // itself is immediate and races across the two connections.
       const pA1 = cA.request("session/prompt", {
         sessionId: sA.sessionId, prompt: [{ type: "text", text: "A-MARKER" }],
-        _meta: { kkamak: { model: HAIKU } },
+        _meta: { kkamak: { model: AGENT_TEST_MODEL } },
       })
       const pB1 = cB.request("session/prompt", {
         sessionId: sB.sessionId, prompt: [{ type: "text", text: "B-MARKER" }],
-        _meta: { kkamak: { model: HAIKU } },
+        _meta: { kkamak: { model: AGENT_TEST_MODEL } },
       })
       const pA2 = cA.request("session/prompt", {
         sessionId: sA.sessionId, prompt: [{ type: "text", text: "A-MARKER-2" }],
-        _meta: { kkamak: { model: HAIKU } },
+        _meta: { kkamak: { model: AGENT_TEST_MODEL } },
       })
       await Promise.all([pA1, pB1, pA2])
 
@@ -1186,7 +1398,7 @@ describe("acp-daemon over unix socket (reaches the stubbed model)", () => {
       c.onNotification("session/update", (p) => updates.push(p.update.content.text))
       await expect(c.request("session/prompt", {
         sessionId: s.sessionId, prompt: [{ type: "text", text: "boom please" }],
-        _meta: { kkamak: { model: HAIKU } },
+        _meta: { kkamak: { model: AGENT_TEST_MODEL } },
       })).rejects.toMatchObject({ code: ACP_ERR_CALL_CONSUMED, data: { callConsumed: true } })
       expect(updates.length).toBe(0)
       c.close()
@@ -1205,7 +1417,7 @@ describe("acp-daemon over unix socket (reaches the stubbed model)", () => {
     const s = await c.request("session/new", { cwd: process.cwd(), mcpServers: [], _meta: { kkamak: { isolation: TEST_ISOLATION } } })
     await expect(c.request("session/prompt", {
       sessionId: s.sessionId, prompt: [{ type: "text", text: "never lands" }],
-      _meta: { kkamak: { model: HAIKU } },
+      _meta: { kkamak: { model: AGENT_TEST_MODEL } },
     })).rejects.toMatchObject({ code: ACP_ERR_CALL_CONSUMED, data: { callConsumed: true } })
     c.close()
   }, DAEMON_TEST_TIMEOUT_MS)
@@ -1250,7 +1462,7 @@ describe("acp-daemon over unix socket (reaches the stubbed model)", () => {
       // answers) -- the cap-1 pool's ONE entry is now busy.
       const aPromise = cA.request("session/prompt", {
         sessionId: sA.sessionId, prompt: [{ type: "text", text: "A hangs" }],
-        _meta: { kkamak: { model: HAIKU } },
+        _meta: { kkamak: { model: AGENT_TEST_MODEL } },
       })
       const crossed = await until(() => cap.count() >= 1, 30_000)
       expect(crossed).toBe(true)
@@ -1263,7 +1475,7 @@ describe("acp-daemon over unix socket (reaches the stubbed model)", () => {
       // (i) -- boolean data first).
       await expect(cB.request("session/prompt", {
         sessionId: sB.sessionId, prompt: [{ type: "text", text: "B never sent" }],
-        _meta: { kkamak: { model: HAIKU } },
+        _meta: { kkamak: { model: AGENT_TEST_MODEL } },
       })).rejects.toMatchObject({ code: -32002, data: { callConsumed: false } })
       expect(cap.count()).toBe(1)   // still just A's one request -- B never reached the model
 
