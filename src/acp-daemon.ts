@@ -81,12 +81,13 @@ import {
 import {
   FrameDecoder, encodeFrame,
   ACP_INITIALIZE, ACP_SESSION_NEW, ACP_SESSION_PROMPT, ACP_SESSION_CANCEL, ACP_SESSION_UPDATE,
-  ACP_SESSION_CLOSE,
-  ACP_ERR_NO_CALL, ACP_ERR_CALL_CONSUMED,
+  ACP_SESSION_CLOSE, ACP_MODELS_LIST,
+  ACP_ERR_NO_CALL, ACP_ERR_CALL_CONSUMED, ACP_ERR_MODELS_NO_AUTH, ACP_ERR_MODELS_UPSTREAM_ERROR,
   ACP_BUDGET,
   type WarmIsolation,
 } from "./acp-wire.ts"
 import { validateJsonRpc, createErrorResponse, JSON_RPC_PARSE_ERROR } from "./jsonrpc.ts"
+import { listModels } from "./models.ts"
 
 /** Production idle budget: 15 minutes. `KKAMAK_ACP_IDLE_MS` overrides for
  * tests (a few seconds) — acp-paths.ts's denylist note is explicit that
@@ -221,8 +222,17 @@ function readPromptText(params: unknown): string {
  *
  * STRUCTURAL RULE: this function must never throw across a connection
  * handler — every branch answers a JSON-RPC result or error frame (or, for
- * a bare notification, nothing) instead of raising. */
-export function createDispatcher(pool: SessionPool, state: DaemonState, fingerprint: string) {
+ * a bare notification, nothing) instead of raising.
+ *
+ * `env` (added for `kkamak/models/list`): the SAME env this daemon was
+ * spawned with, threaded through so a stateless-metadata method can call
+ * `listModels(env)` directly — no session, no pool, no ApiSession. */
+export function createDispatcher(
+  pool: SessionPool,
+  state: DaemonState,
+  fingerprint: string,
+  env: Record<string, string | undefined>,
+) {
   return async function handle(frame: unknown, write: Write): Promise<void> {
     const req = frame as { id?: number | string; method?: unknown; params?: unknown }
     const id = req.id
@@ -237,9 +247,13 @@ export function createDispatcher(pool: SessionPool, state: DaemonState, fingerpr
       if (id === undefined) return
       write({ jsonrpc: "2.0", id, result })
     }
-    const respondError = (code: number, message: string, data?: { callConsumed: boolean }): void => {
+    // `data` is `unknown`, not narrowed to `{callConsumed: boolean}` — the
+    // outcome-law errors (no-call/call-consumed) are the ONLY ones that
+    // field belongs to; kkamak/models/list's errors (below) carry their
+    // own, unrelated data shape and share this same helper.
+    const respondError = (code: number, message: string, data?: unknown): void => {
       if (id === undefined) return
-      write({ jsonrpc: "2.0", id, error: data ? { code, message, data } : { code, message } })
+      write({ jsonrpc: "2.0", id, error: data !== undefined ? { code, message, data } : { code, message } })
     }
 
     // Defense-in-depth for the catch-all below (WarmSession's own contract
@@ -444,6 +458,33 @@ export function createDispatcher(pool: SessionPool, state: DaemonState, fingerpr
           return
         }
 
+        case ACP_MODELS_LIST: {
+          // Stateless metadata, not a turn: no session/new, no pool.acquire,
+          // no ApiSession — answered directly. budgetMs omitted deliberately:
+          // listModels(env) already defaults to DEFAULT_MODELS_BUDGET_MS
+          // (models.ts) when not given one, which IS this method's timeout
+          // leg; no reason to re-export that constant just to hand it back.
+          const outcome = await listModels(env)
+          if (outcome.kind === "ok") {
+            // RESULT IS ModelInfo[] VERBATIM — the daemon is a pipe here,
+            // not a curator, consistent with models.ts re-exporting the
+            // SDK's own ModelInfo rather than trimming it.
+            respond(outcome.models)
+            return
+          }
+          if (outcome.kind === "no-auth") {
+            respondError(ACP_ERR_MODELS_NO_AUTH, "no resolvable credentials")
+            return
+          }
+          // outcome.kind === "error"
+          respondError(
+            ACP_ERR_MODELS_UPSTREAM_ERROR,
+            outcome.message ?? "upstream error",
+            outcome.status !== undefined ? { status: outcome.status } : undefined,
+          )
+          return
+        }
+
         default:
           respondError(-32601, `unknown method: ${method}`)
           return
@@ -559,7 +600,7 @@ async function runServer(
   // No makeSession override -> the pool's own default (ApiSession, Task 5).
   const pool = new SessionPool(env, opts?.makeSession ? { makeSession: opts.makeSession } : {})
   const state = createDaemonState()
-  const dispatch = createDispatcher(pool, state, fingerprint)
+  const dispatch = createDispatcher(pool, state, fingerprint, env)
   const clients = new Set<WsConnection>()
   // Daemon-level activity clock (N3c-iii): the single WarmSession's own
   // `idleMs()` gate no longer exists — a pool can hold several entries, each
@@ -727,7 +768,7 @@ async function runStdio(
   // No makeSession override -> the pool's own default (ApiSession, Task 5).
   const pool = new SessionPool(env, opts?.makeSession ? { makeSession: opts.makeSession } : {})
   const state = createDaemonState()
-  const dispatch = createDispatcher(pool, state, fingerprint)
+  const dispatch = createDispatcher(pool, state, fingerprint, env)
   const decoder = new FrameDecoder()
   const write: Write = (msg) => {
     try { process.stdout.write(encodeFrame(msg)) } catch { /* peer gone (e.g. EPIPE) */ }

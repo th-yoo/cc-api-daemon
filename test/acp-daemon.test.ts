@@ -473,6 +473,80 @@ describe("acp-daemon wire behaviour (no model reached)", () => {
   }, DAEMON_TEST_TIMEOUT_MS)
 })
 
+// ── kkamak/models/list: stateless model enumeration. Reaches a stub of the
+// Models API (GET /v1/models), never messages.create -- no session/new, no
+// pool, no ApiSession, on every test below. Zero real spend: the stub
+// terminates the HTTP leg locally, same discipline as every other
+// real-daemon describe block in this file.
+describe("acp-daemon dispatcher — kkamak/models/list", () => {
+  const MODEL_A = {
+    type: "model" as const,
+    id: "claude-haiku-4-5-20251001",
+    display_name: "Claude Haiku 4.5",
+    created_at: "2025-10-01T00:00:00Z",
+    max_input_tokens: 200_000,
+    max_tokens: 64_000,
+    capabilities: null,
+  }
+
+  function pageBody(data: Array<typeof MODEL_A>): Response {
+    return Response.json({ data, has_more: false, first_id: data[0]?.id ?? null, last_id: null })
+  }
+
+  /** `GET /v1/models` carries no request body — sdk-stub.ts's `stubServer`
+   * treats a bodyless request as a bare connectivity probe (built for
+   * `POST /v1/messages`) and never calls its handler for one, so it cannot
+   * serve this endpoint. A dedicated minimal stub, matching
+   * test/models.test.ts's own pattern for the same reason. */
+  function modelsStub(respond: () => Response | Promise<Response>): { url: string; stop: () => void } {
+    const server = Bun.serve({ port: 0, fetch: async () => respond() })
+    return { url: `http://127.0.0.1:${server.port}`, stop: () => server.stop(true) }
+  }
+
+  test("ok: returns ModelInfo[] verbatim, with NO session/new ever called", async () => {
+    const e = tempEndpoint("models-ok"); LIVE.push(e)
+    const cap = modelsStub(() => pageBody([MODEL_A]))
+    try {
+      const { env } = spawnDaemon(e.home, e.spawnLog, { ANTHROPIC_BASE_URL: cap.url })
+      await waitForSpawnLog(e.spawnLog, 1, 15_000)
+      const c = await connectNdjson(env)
+      await c.request("initialize", { protocolVersion: 1 })
+      // Deliberately no session/new call at all -- kkamak/models/list is
+      // stateless metadata, callable right after initialize.
+      const models = await c.request("kkamak/models/list")
+      expect(models).toEqual([MODEL_A])
+      c.close()
+    } finally { cap.stop() }
+  }, DAEMON_TEST_TIMEOUT_MS)
+
+  test("no-auth: ACP_ERR_MODELS_NO_AUTH (-32004), distinct from the outcome-law codes", async () => {
+    const e = tempEndpoint("models-noauth"); LIVE.push(e)
+    // Empty string, not omitted: spawnDaemon's ANTHROPIC_API_KEY:"k" would
+    // otherwise win. auth.ts treats an empty-string value as absent, so
+    // this falls through to the credentials-file lane, which fails under
+    // this test's own throwaway (real-credentials-free) HOME.
+    const { env } = spawnDaemon(e.home, e.spawnLog, { ANTHROPIC_API_KEY: "" })
+    await waitForSpawnLog(e.spawnLog, 1, 15_000)
+    const c = await connectNdjson(env)
+    await c.request("initialize", { protocolVersion: 1 })
+    await expect(c.request("kkamak/models/list")).rejects.toMatchObject({ code: -32004 })
+    c.close()
+  }, DAEMON_TEST_TIMEOUT_MS)
+
+  test("upstream error: ACP_ERR_MODELS_UPSTREAM_ERROR (-32005) carries the HTTP status, distinct from -32002's pool-exhausted meaning", async () => {
+    const e = tempEndpoint("models-error"); LIVE.push(e)
+    const cap = modelsStub(() => new Response("boom", { status: 500 }))
+    try {
+      const { env } = spawnDaemon(e.home, e.spawnLog, { ANTHROPIC_BASE_URL: cap.url })
+      await waitForSpawnLog(e.spawnLog, 1, 15_000)
+      const c = await connectNdjson(env)
+      await c.request("initialize", { protocolVersion: 1 })
+      await expect(c.request("kkamak/models/list")).rejects.toMatchObject({ code: -32005, data: { status: 500 } })
+      c.close()
+    } finally { cap.stop() }
+  }, DAEMON_TEST_TIMEOUT_MS)
+})
+
 // ── dispatcher-level unit tests against a FAKE SessionPool (a real
 // SessionPool with a DI `makeSession`): no daemon process, no CLI, no
 // credentials, no real turn timing -- these exist to pin the `outstanding`
@@ -551,7 +625,7 @@ describe("acp-daemon dispatcher — outstanding-tag bookkeeping (fake SessionPoo
     // session/new dispatch: this test's whole point is the OUTSTANDING
     // bookkeeping, not the session/new flow.
     state.sessions.set(S, { createdAt: Date.now(), isolation: TEST_ISOLATION })
-    const dispatch = createDispatcher(pool, state, "fp")
+    const dispatch = createDispatcher(pool, state, "fp", {})
     const frames: Array<Record<string, unknown>> = []
     const write = (m: object) => frames.push(m as Record<string, unknown>)
 
@@ -600,7 +674,7 @@ describe("acp-daemon dispatcher — outstanding-tag bookkeeping (fake SessionPoo
     const state = createDaemonState()
     state.sessions.set("A", { createdAt: Date.now(), isolation: TEST_ISOLATION })
     state.sessions.set("B", { createdAt: Date.now(), isolation: TEST_ISOLATION })
-    const dispatch = createDispatcher(pool, state, "fp")
+    const dispatch = createDispatcher(pool, state, "fp", {})
     const write = () => {}
 
     const pA = dispatch({ id: 1, method: "session/prompt", params: {
@@ -637,7 +711,7 @@ describe("acp-daemon dispatcher — outstanding-tag bookkeeping (fake SessionPoo
     const state = createDaemonState()
     state.sessions.set("A", { createdAt: Date.now(), isolation: TEST_ISOLATION })
     state.sessions.set("B", { createdAt: Date.now(), isolation: TEST_ISOLATION })
-    const dispatch = createDispatcher(pool, state, "fp")
+    const dispatch = createDispatcher(pool, state, "fp", {})
     const write = () => {}
 
     const pA = dispatch({ id: 1, method: "session/prompt", params: {
@@ -684,7 +758,7 @@ describe("acp-daemon dispatcher — session/new isolation structural validation"
   test("empty object isolation ({}) is rejected with -32602 and no session is recorded", async () => {
     const { pool } = fakeDispatchPool()
     const state = createDaemonState()
-    const dispatch = createDispatcher(pool, state, "fp")
+    const dispatch = createDispatcher(pool, state, "fp", {})
     const frames: Array<Record<string, unknown>> = []
     await dispatch({ id: 1, method: "session/new", params: {
       cwd: process.cwd(), mcpServers: [], _meta: { kkamak: { isolation: {} } },
@@ -696,7 +770,7 @@ describe("acp-daemon dispatcher — session/new isolation structural validation"
   test("array isolation ([]) is rejected with -32602 and no session is recorded", async () => {
     const { pool } = fakeDispatchPool()
     const state = createDaemonState()
-    const dispatch = createDispatcher(pool, state, "fp")
+    const dispatch = createDispatcher(pool, state, "fp", {})
     const frames: Array<Record<string, unknown>> = []
     await dispatch({ id: 1, method: "session/new", params: {
       cwd: process.cwd(), mcpServers: [], _meta: { kkamak: { isolation: [] } },
@@ -708,7 +782,7 @@ describe("acp-daemon dispatcher — session/new isolation structural validation"
   test("partial isolation (only systemPrompt) is rejected with -32602 and no session is recorded", async () => {
     const { pool } = fakeDispatchPool()
     const state = createDaemonState()
-    const dispatch = createDispatcher(pool, state, "fp")
+    const dispatch = createDispatcher(pool, state, "fp", {})
     const frames: Array<Record<string, unknown>> = []
     await dispatch({ id: 1, method: "session/new", params: {
       cwd: process.cwd(), mcpServers: [], _meta: { kkamak: { isolation: { systemPrompt: "x" } } },
@@ -720,7 +794,7 @@ describe("acp-daemon dispatcher — session/new isolation structural validation"
   test("partial isolation missing only settings.autoMemoryEnabled is rejected with -32602", async () => {
     const { pool } = fakeDispatchPool()
     const state = createDaemonState()
-    const dispatch = createDispatcher(pool, state, "fp")
+    const dispatch = createDispatcher(pool, state, "fp", {})
     const frames: Array<Record<string, unknown>> = []
     const { settings: _omit, ...rest } = TEST_ISOLATION
     await dispatch({ id: 1, method: "session/new", params: {
@@ -733,7 +807,7 @@ describe("acp-daemon dispatcher — session/new isolation structural validation"
   test("full TEST_ISOLATION is accepted and a session is recorded", async () => {
     const { pool } = fakeDispatchPool()
     const state = createDaemonState()
-    const dispatch = createDispatcher(pool, state, "fp")
+    const dispatch = createDispatcher(pool, state, "fp", {})
     const frames: Array<Record<string, unknown>> = []
     await dispatch({ id: 1, method: "session/new", params: {
       cwd: process.cwd(), mcpServers: [], _meta: { kkamak: { isolation: TEST_ISOLATION } },
@@ -745,7 +819,7 @@ describe("acp-daemon dispatcher — session/new isolation structural validation"
   test("full TEST_ISOLATION_2 is accepted and a session is recorded", async () => {
     const { pool } = fakeDispatchPool()
     const state = createDaemonState()
-    const dispatch = createDispatcher(pool, state, "fp")
+    const dispatch = createDispatcher(pool, state, "fp", {})
     const frames: Array<Record<string, unknown>> = []
     await dispatch({ id: 1, method: "session/new", params: {
       cwd: process.cwd(), mcpServers: [], _meta: { kkamak: { isolation: TEST_ISOLATION_2 } },
@@ -763,7 +837,7 @@ describe("acp-daemon dispatcher — session/new isolation structural validation"
   test("non-empty tools (e.g. [\"Bash\"]) is rejected with -32602 and no session is recorded", async () => {
     const { pool } = fakeDispatchPool()
     const state = createDaemonState()
-    const dispatch = createDispatcher(pool, state, "fp")
+    const dispatch = createDispatcher(pool, state, "fp", {})
     const frames: Array<Record<string, unknown>> = []
     const tainted = { ...TEST_ISOLATION, tools: ["Bash"] }
     await dispatch({ id: 1, method: "session/new", params: {
@@ -776,7 +850,7 @@ describe("acp-daemon dispatcher — session/new isolation structural validation"
   test("non-empty settingSources (e.g. [\"project\"]) is rejected with -32602 and no session is recorded", async () => {
     const { pool } = fakeDispatchPool()
     const state = createDaemonState()
-    const dispatch = createDispatcher(pool, state, "fp")
+    const dispatch = createDispatcher(pool, state, "fp", {})
     const frames: Array<Record<string, unknown>> = []
     const tainted = { ...TEST_ISOLATION, settingSources: ["project"] }
     await dispatch({ id: 1, method: "session/new", params: {
@@ -789,7 +863,7 @@ describe("acp-daemon dispatcher — session/new isolation structural validation"
   test("thinking.type \"adaptive\" (not in the closed union) is rejected with -32602", async () => {
     const { pool } = fakeDispatchPool()
     const state = createDaemonState()
-    const dispatch = createDispatcher(pool, state, "fp")
+    const dispatch = createDispatcher(pool, state, "fp", {})
     const frames: Array<Record<string, unknown>> = []
     const tainted = { ...TEST_ISOLATION, thinking: { type: "adaptive" } }
     await dispatch({ id: 1, method: "session/new", params: {
@@ -802,7 +876,7 @@ describe("acp-daemon dispatcher — session/new isolation structural validation"
   test("thinking.type garbage string is rejected with -32602", async () => {
     const { pool } = fakeDispatchPool()
     const state = createDaemonState()
-    const dispatch = createDispatcher(pool, state, "fp")
+    const dispatch = createDispatcher(pool, state, "fp", {})
     const frames: Array<Record<string, unknown>> = []
     const tainted = { ...TEST_ISOLATION, thinking: { type: "not-a-real-value" } }
     await dispatch({ id: 1, method: "session/new", params: {
@@ -824,7 +898,7 @@ describe("acp-daemon dispatcher — session/close", () => {
     const state = createDaemonState()
     const S = "session-under-test"
     state.sessions.set(S, { createdAt: Date.now(), isolation: TEST_ISOLATION })
-    const dispatch = createDispatcher(pool, state, "fp")
+    const dispatch = createDispatcher(pool, state, "fp", {})
     const frames: Array<Record<string, unknown>> = []
     const write = (m: object) => frames.push(m as Record<string, unknown>)
 
@@ -851,7 +925,7 @@ describe("acp-daemon dispatcher — session/close", () => {
   test("session/close for an unknown session responds closed:false unknown-session", async () => {
     const { pool } = fakeDispatchPool()
     const state = createDaemonState()
-    const dispatch = createDispatcher(pool, state, "fp")
+    const dispatch = createDispatcher(pool, state, "fp", {})
     const frames: Array<Record<string, unknown>> = []
     const write = (m: object) => frames.push(m as Record<string, unknown>)
 
@@ -864,7 +938,7 @@ describe("acp-daemon dispatcher — session/close", () => {
     const state = createDaemonState()
     const S = "session-under-test-busy"
     state.sessions.set(S, { createdAt: Date.now(), isolation: TEST_ISOLATION })
-    const dispatch = createDispatcher(pool, state, "fp")
+    const dispatch = createDispatcher(pool, state, "fp", {})
     const frames: Array<Record<string, unknown>> = []
     const write = (m: object) => frames.push(m as Record<string, unknown>)
 

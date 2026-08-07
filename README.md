@@ -233,6 +233,53 @@ switch (one.kind) {
 partial-success arm; a failure partway through a multi-page walk discards
 what was collected and returns `error`.
 
+### `kkamak/models/list` — model enumeration ON THE WIRE
+
+`listModels`/`retrieveModel` above are direct SDK calls — no daemon
+involved at all, one process's own credentials. `kkamak/models/list` is the
+same capability reachable *through* the daemon, over the socket, for a
+caller that only speaks ACP and has no direct access to this process's own
+`listModels` import:
+
+```
+--> {"jsonrpc":"2.0","id":1,"method":"kkamak/models/list"}
+<-- {"jsonrpc":"2.0","id":1,"result":[{"id":"claude-haiku-4-5-20251001", ...}]}
+```
+
+Stateless metadata, not a turn — callable any time after `initialize`, no
+`session/new` needed. `result` is `ModelInfo[]` verbatim (the daemon is a
+pipe here, not a curator, matching `listModels`'s own re-export-don't-trim
+choice). Namespaced `kkamak/models/list`, not `models/list` — see
+`src/acp-wire.ts`'s own comment above `ACP_MODELS_LIST` for why a bare
+`models/*` would squat on a name ACP itself might reserve.
+
+**Credential boundary**: results come from the *daemon's* resolved
+credentials, never the caller's — a client learns what the daemon can see,
+not what the client's own process could see if it called the Anthropic API
+directly. Combined with the daemon's no-auth WebSocket ruling (see
+"Security" above), this means any local process — or, per that same
+ruling, any web page the user's browser has open — can enumerate whatever
+models the daemon's credentials expose. Low stakes (read-only, unbilled
+metadata, no credential value crosses the wire), but stated here rather
+than left implicit.
+
+Errors are its own pair, deliberately not `daemonCall`'s no-call/
+call-consumed (that vocabulary encodes billed-call spend-risk; this is an
+unbilled GET, same reasoning as `listModels`'s own outcome vocabulary
+above) and deliberately not `-32002`/`-32003` either (`-32002` already
+means "pool exhausted" on `session/prompt` in this daemon):
+
+- `-32004` — no resolvable credentials (mirrors `listModels`'s `no-auth`).
+- `-32005` — any other upstream failure; `error.data.status` carries the
+  HTTP status when the SDK's `APIError` provided one.
+
+Not yet done, on purpose: **no caching**. Model lists are near-static and
+this is a plausible place to cache a response for a short TTL, but this
+first cut ships uncached — every `kkamak/models/list` call is a real
+`GET /v1/models` round-trip. Add caching later as its own deliberate
+change if the extra latency/request volume becomes a real cost, not
+bundled in here.
+
 ## Known limitations
 
 - `canonicalModel === model` always — the raw API exposes exactly one

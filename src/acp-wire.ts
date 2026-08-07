@@ -54,6 +54,19 @@ export const ACP_SESSION_UPDATE = "session/update"
  * a no-op by spec, same as `session/cancel`'s own ack. */
 export const ACP_SESSION_CLOSE = "session/close"
 
+/** Model enumeration. Namespaced `kkamak/models/list`, NOT `models/list` —
+ * the extensibility rule this file already applies to `_meta` fields (see
+ * the comment above `AcpInitializeResult` below) reasons identically about
+ * method NAMES: ACP has `session/*` today and could plausibly add
+ * `models/*` tomorrow (agents do have models), so a bare `models/list`
+ * would squat on a name the spec might reserve. Stateless metadata, not a
+ * turn: no session/new, no pool acquire, no ApiSession involvement —
+ * callable any time after `initialize`, answered directly by the
+ * dispatcher. Wraps `models.ts`'s `listModels`, itself a direct,
+ * unbilled `GET /v1/models` — see the error codes below for why that
+ * means it does NOT reuse ACP_ERR_NO_CALL/ACP_ERR_CALL_CONSUMED. */
+export const ACP_MODELS_LIST = "kkamak/models/list"
+
 /** §6e law L1/L4 — the prompt bytes never crossed the boundary toward the
  * model. The caller MAY fall back to the one-shot lane without breaking
  * §4's exactly-one-call rule. This is the ONLY safe fallback signal. */
@@ -62,6 +75,24 @@ export const ACP_ERR_NO_CALL = -32000
  * failed. The caller MUST NOT fall back; the record stays
  * pending/retryable. */
 export const ACP_ERR_CALL_CONSUMED = -32001
+
+/** `kkamak/models/list`'s own error codes — deliberately NOT
+ * ACP_ERR_NO_CALL/ACP_ERR_CALL_CONSUMED, and not -32002/-32003 either
+ * (that -32002 already means "pool exhausted" on `session/prompt`,
+ * baked into acp-daemon.ts and test/acp-fake-daemon.ts's fixtures — a
+ * fresh code picks up where the pool-exhaustion precedent leaves off,
+ * -32004, rather than overload -32002 with two meanings depending on
+ * which method a client happens to be looking at). The no-call/
+ * call-consumed pair exists specifically to encode BILLED-CALL
+ * spend-risk ("did a paid messages.create provably not happen, or is
+ * there ambiguity after it") for a caller who must not double-spend —
+ * exactly the same distinction models.ts's own `ok`/`no-auth`/`error`
+ * vocabulary already draws against DaemonOutcome (commit 80ae1ea).
+ * `GET /v1/models` is unbilled and idempotent: retrying it costs
+ * nothing, so there is no spend-risk boundary to protect and reusing
+ * that vocabulary here would misleadingly imply one. */
+export const ACP_ERR_MODELS_NO_AUTH = -32004
+export const ACP_ERR_MODELS_UPSTREAM_ERROR = -32005
 
 /** Credential resolution (keychain exec / credentials-file read, auth.ts's
  * EXEC_TIMEOUT_MS) runs BEFORE the HTTP phase and carries its own 10s worst
