@@ -6,16 +6,21 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `@th-yoo/cc-api-daemon` — an ACP (Agent Client Protocol) daemon: a
 localhost WebSocket server, JSON-RPC, a session pool. Same wire protocol,
-pool, and outcome semantics as meta-harness's `cc-gate-plugin/src/acp`,
-but backed by `@anthropic-ai/sdk`'s `messages.create` instead of a spawned
-Claude Code CLI subprocess — every turn is exactly one `messages.create`
-call, not a subprocess round-trip. **The WebSocket handshake is
-unauthenticated by deliberate ruling — read "Security" below before
-touching the transport layer.**
+pool, and outcome semantics as meta-harness's `cc-gate-plugin/src/acp`.
+Two backends, picked per model by `routeBackend` (`src/route.ts`):
+`ApiSession` answers a turn with one `@anthropic-ai/sdk` `messages.create`
+call, `WarmSession` through a warm `@anthropic-ai/claude-agent-sdk` CLI
+subprocess. Only models matching `haiku` take the direct-API lane;
+everything else, including unrecognized models, defaults to `agent`
+because the bare SDK 429s on sonnet/opus/fable (measured twice — see
+`route.ts`, and don't invert the default without re-measuring). **The
+WebSocket handshake is unauthenticated by deliberate ruling — read
+"Security" below before touching the transport layer.**
 
 Client trio: `ensureDaemon` (connect-or-spawn over WebSocket),
-`daemonCall` (one turn), `closeSession`. `ApiSession` is the default
-backend the daemon's pool constructs — injectable via `makeSession`, see
+`daemonCall` (one turn), `closeSession`. `WarmSession` is what the pool's
+`makeSession` defaults to (`acp-pool.ts`); `ApiSession` is never pooled at
+all — it bypasses the pool. Both are injectable via `makeSession`, see
 "Swapping the backend" below. Two more exports, `listModels`/`retrieveModel`,
 wrap the Anthropic Models API directly (no daemon involved) — a capability
 the ACP wire itself has no method for; see "Model metadata" below — with a
@@ -256,7 +261,9 @@ convert a would-be `no-call` into a `call-consumed`, never the reverse.
 `acp-daemon.ts`'s `runServer`/`runStdio` (and the lower-level
 `createDaemonState`) accept `opts.makeSession?: (env, warmOpts) =>
 DispatchableSession`, threaded straight through to `SessionPool`. Omit it
-and the pool defaults to `(e, warmOpts) => new ApiSession(e, warmOpts)`.
+and the pool defaults to `(e, warmOpts) => new WarmSession(e, warmOpts)`
+(`acp-pool.ts`) — `ApiSession` is never pooled; the dispatcher routes
+haiku turns to it directly, bypassing the pool.
 This is the supported seam for injecting a different backend (another
 model provider, a scripted fake for tests) without touching the wire layer
 — `session-contract.ts`'s `DispatchableSession` is what both sides are

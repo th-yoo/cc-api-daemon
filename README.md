@@ -1,19 +1,22 @@
 # @th-yoo/cc-api-daemon
 
 An ACP (Agent Client Protocol) daemon — a localhost WebSocket server,
-JSON-RPC, a session pool — with `@anthropic-ai/sdk`'s `messages.create` as
-the backend instead of a spawned Claude Code CLI subprocess. Same wire
-protocol, pool, and outcome semantics as meta-harness's
-`cc-gate-plugin/src/acp`; every turn is exactly one `messages.create` call.
+JSON-RPC, a session pool — with the same wire protocol, pool, and outcome
+semantics as meta-harness's `cc-gate-plugin/src/acp`.
+
+**Two backends, picked per model.** `ApiSession` answers a turn with one
+`@anthropic-ai/sdk` `messages.create` call; `WarmSession` answers it through
+a warm `@anthropic-ai/claude-agent-sdk` CLI subprocess. `routeBackend`
+decides which, and the choice is forced by upstream behavior rather than
+preference — see "Backend routing" below before assuming a model takes the
+direct-API path.
 
 `ensureDaemon`/`daemonCall`/`closeSession` are the client trio: connect to a
-running daemon, or spawn one, over a real WebSocket. `ApiSession` is the
-injectable backend the daemon runs by default (see "Swapping the backend"
-below). `listModels`/`retrieveModel` wrap the Anthropic Models API — a
-capability the ACP wire itself has no method for; see "Model metadata"
-below. **Read "Security" below before running this on a machine you share
-with anything else** — the daemon authenticates no WebSocket connection at
-all.
+running daemon, or spawn one, over a real WebSocket.
+`listModels`/`retrieveModel` wrap the Anthropic Models API — a capability
+the ACP wire itself has no method for; see "Model metadata" below. **Read
+"Security" below before running this on a machine you share with anything
+else** — the daemon authenticates no WebSocket connection at all.
 
 ## Install
 
@@ -97,15 +100,25 @@ daemon is a script, not a library call.
 
 ## Auth
 
-Credential precedence, first hit wins:
+On the **`api` lane**, credential precedence is `auth.ts`'s ladder, first
+hit wins:
 
 1. `env.ANTHROPIC_API_KEY`
 2. `env.ANTHROPIC_AUTH_TOKEN`
 3. darwin: macOS keychain item `Claude Code-credentials`
 4. else: `~/.claude/.credentials.json`
 
-Resolved **daemon-side** now (inside `ApiSession`, per turn), not by the
-client process that calls `daemonCall`. The env that matters is whichever
+Resolved **daemon-side** (inside `ApiSession`, per turn), not by the
+client process that calls `daemonCall`.
+
+On the **`agent` lane** this ladder does not run at all — `warm-session.ts`
+contains no credential code; the spawned `claude` CLI resolves its own,
+honoring an explicit `ANTHROPIC_API_KEY` over on-disk/keychain credentials.
+That precedence is empirical, so it is regression-locked by a test that runs
+on every gate invocation (`test/warm-session.test.ts`'s credential-precedence
+guard, deliberately exempt from `KKAMAK_GATE_FAST`) — a silent CLI-side flip
+would otherwise leak a real OAuth token to a localhost stub with nothing
+raising an alarm. The env that matters is whichever
 one first spawned the daemon: `Bun.spawn`'s `env` option *replaces* the
 child process's environment rather than merging with the caller's, so the
 daemon subprocess runs with exactly the env object passed to the
@@ -162,16 +175,49 @@ any request carrying an `Origin` header at all, and keep the token in a
 `0600` file next to the discovery entry. Roughly 30 lines. Noted here so
 the option is costed, not to relitigate it.
 
+## Backend routing
+
+`routeBackend(model)` (`src/route.ts`) picks the lane for every turn:
+
+| Model | Lane | What runs |
+|---|---|---|
+| contains `haiku` | `api` | `ApiSession` — one `messages.create`, no subprocess |
+| anything else (incl. unrecognized) | `agent` | `WarmSession` — warm `claude-agent-sdk` CLI |
+
+**This is a hard constraint, not a preference.** Measured twice (2026-08-06,
+2026-08-07): the bare-SDK transport returns 200 for haiku but **429** for
+`claude-sonnet-5`, `claude-opus-5`, and `claude-fable-5`. The Agent-SDK lane
+serves all of them. So an *unrecognized* model deliberately defaults to
+`agent` — degrading to "heavier than necessary" is fine, degrading to a 429
+is not. Don't invert this default without re-measuring.
+
+Consequences worth knowing before you pick a model:
+
+- Only the `api` lane is capped at one HTTP call per turn (`maxRetries: 0`,
+  `src/client.ts`). The `agent` lane's retry behavior is the CLI's own.
+- Only the `api` lane reads `.system` (see below). A `.system` file has no
+  effect on a sonnet/opus/fable turn.
+- `ApiSession` is **never pooled** — it bypasses the pool entirely. The
+  pool exists for `WarmSession`, which is what `makeSession` defaults to
+  (`src/acp-pool.ts`).
+
+### `.system` — local system-prompt prefix
+
+If a gitignored `.system` file exists at the daemon's cwd, its contents are
+prefixed to the turn's system prompt, ahead of `isolation.systemPrompt`
+(`src/call.ts`). Read fresh per call, never cached. **`api` lane only** —
+`WarmSession` has no equivalent, so this silently does nothing for any model
+that routes to `agent`.
+
 ## Swapping the backend
 
-`ApiSession` is the default session the daemon's pool constructs, but it is
-injectable — `acp-daemon.ts`'s `runServer`/`runStdio` (and the lower-level
-`createDaemonState`) both accept a `makeSession` option shaped
-`(env, warmOpts) => DispatchableSession`. A host embedding this daemon can
-supply its own backend (a different model provider, a scripted fake for
-tests) without touching the wire layer; `session-contract.ts`'s
-`DispatchableSession` is the contract both implementations are checked
-against.
+Both backends are injectable — `acp-daemon.ts`'s `runServer`/`runStdio` (and
+the lower-level `createDaemonState`) accept a `makeSession` option shaped
+`(env, warmOpts) => DispatchableSession`, which the pool uses in place of its
+`WarmSession` default. A host embedding this daemon can supply its own
+backend (a different model provider, a scripted fake for tests) without
+touching the wire layer; `session-contract.ts`'s `DispatchableSession` is the
+contract both implementations are checked against.
 
 ## Outcome law
 
@@ -185,7 +231,8 @@ against.
   budget expiry with no response, empty content. A call may have been
   spent; the caller must NOT double-spend.
 - `maxRetries: 0` on the daemon's own SDK client — exactly one HTTP call
-  ever per turn.
+  ever per turn. **`api` lane only**; on the `agent` lane the CLI owns its
+  own retry behavior (see "Backend routing").
 
 This vocabulary is specific to `daemonCall`'s billed `messages.create` send —
 see "Model metadata" below for the separate, unbilled-GET outcome vocabulary
@@ -282,9 +329,12 @@ bundled in here.
 
 ## Known limitations
 
-- `canonicalModel === model` always — the raw API exposes exactly one
-  identity field, so `modelProvenBy`'s `canonicalModel` branch is dead code
-  here. Documented, not "fixed".
+- `canonicalModel === model` on the **`api` lane only** — the raw API
+  exposes exactly one identity field, so `call.ts` sets both from
+  `response.model` and `modelProvenBy`'s `canonicalModel` branch never
+  decides anything there. On the `agent` lane that branch is live:
+  `warm-session.ts` reads each modelUsage entry's own `canonicalModel`,
+  a genuinely separate value from the entry key. Documented, not "fixed".
 - HTTP 401 classifies as `call-consumed` even though it provably consumed
   nothing — classification is uniformly post-`messages.create`;
   distinguishing status codes is a non-goal.
@@ -310,7 +360,8 @@ bundled in here.
 - `listModels`/`retrieveModel` don't expose the Models API's `betas`
   parameter yet — add later as its own deliberate widening if a caller
   needs a beta-gated model list.
-- `ApiSession`'s dispatch loop has no yield point between dequeuing a turn
+- `ApiSession`'s dispatch loop (so: haiku turns only, per "Backend routing")
+  has no yield point between dequeuing a turn
   and marking it sent — `session/cancel` can never preempt a turn already
   in `drain()`'s hands, unlike the CLI-backed daemon this package mirrors,
   whose dynamic `import()` gave cancel a real pre-send window. Under the
