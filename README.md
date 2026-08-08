@@ -14,7 +14,11 @@ direct-API path.
 `ensureDaemon`/`daemonCall`/`closeSession` are the client trio: connect to a
 running daemon, or spawn one, over a real WebSocket.
 `listModels`/`retrieveModel` wrap the Anthropic Models API — a capability
-the ACP wire itself has no method for; see "Model metadata" below. **Read
+the ACP wire itself has no method for; see "Model metadata" below. A
+second subpath, `@th-yoo/cc-api-daemon/testing`, publishes this package's
+own test machinery (a WebSocket fake daemon, discovery-file helpers,
+temp-`HOME`/daemon-reaping utilities) for a consumer testing its own code
+against this daemon/client — see "Testing helpers" below. **Read
 "Security" below before running this on a machine you share with anything
 else** — the daemon authenticates no WebSocket connection at all.
 
@@ -331,6 +335,62 @@ first cut ships uncached — every `acp/models/list` call is a real
 `GET /v1/models` round-trip. Add caching later as its own deliberate
 change if the extra latency/request volume becomes a real cost, not
 bundled in here.
+
+## Testing helpers (`./testing`)
+
+A second `exports` entry, `@th-yoo/cc-api-daemon/testing`, publishes the
+test machinery this package's own suite is built on — so a consumer testing
+ITS OWN code against this daemon/client doesn't have to re-implement (and
+inevitably drift from) a fake daemon or discovery-file plumbing:
+
+```ts
+import {
+  fakeDaemon, discoveryPath, readDiscovery, writeDiscovery,
+  tempHome, tempEnv, LIVE_HOMES, cleanupTempHomes,
+  killDaemonByPid, waitForLines, LIVE_DAEMONS, reapDaemons,
+} from "@th-yoo/cc-api-daemon/testing"
+```
+
+- **`fakeDaemon(env, opts)`** — a scripted ACP daemon over a real WebSocket
+  (no `WarmSession`, no CLI subprocess, no real model call). Mirrors the
+  real daemon's wire shape exactly where it matters for a client under
+  test: the `initialize` fingerprint echo, `_meta.kkamak` namespacing, and
+  the `session/update`-then-`session/prompt`-result ordering. `opts.answer`
+  scripts the outcome (`"ok"`, `"no-call"`, `"call-consumed"`, a hung
+  connection, a mid-turn disconnect, and several malformed-response shapes
+  for testing a client's own defensive parsing). Returns a handle with
+  `stop()` plus accessors for what it captured (`sawPrompt()`,
+  `promptParams()`, `sessionNewParams()`, `closeParams()`).
+- **`discoveryPath`/`readDiscovery`/`writeDiscovery`** — the same discovery-
+  file plumbing the real daemon/client use. `readDiscovery` matters for a
+  *negative* test: asserting that no discovery file was published at all.
+- **`tempHome(tag)`/`tempEnv(tag, extra?)`** — a throwaway `HOME` dir per
+  test, and a full env object built on it (spread `process.env`, a fixed
+  `KKAMAK_ACP_TEST_MARKER`, then `HOME`, then `extra` last so it always
+  wins) — the same isolation lever this package's own daemon/client tests
+  use so no test ever touches the real host's `~/.config/acpd/`.
+- **`killDaemonByPid(spawnLog)`/`waitForLines(file, n, ms)`** — SIGTERM a
+  real spawned daemon by reading pids out of its spawn log (never
+  `pkill -f` — a host-wide kill is not this package's to do), and poll a
+  spawn-log-shaped file for at least `n` lines.
+
+**The cleanup obligation.** `tempEnv`/direct `LIVE_HOMES.push`/
+`LIVE_DAEMONS.push` register onto module-level registries that NOTHING in
+this package sweeps automatically — there is no `afterEach` inside
+`./testing` itself (that would require importing a specific test runner,
+which this subpath deliberately does not do). **You must call
+`cleanupTempHomes()` and `reapDaemons()` from your own suite's teardown**
+(`afterEach`/`afterAll`). Skipping this does not fail loudly: it just leaks
+a throwaway `HOME` dir per test on disk, and leaves every spawned real
+daemon alive for the full `ACP_BUDGET`-independent `DEFAULT_IDLE_MS`
+(900 000 ms) idle window before it self-reaps.
+
+```ts
+afterEach(() => {
+  reapDaemons()
+  cleanupTempHomes()
+})
+```
 
 ## Known limitations
 
