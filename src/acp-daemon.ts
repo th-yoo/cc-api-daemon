@@ -157,6 +157,21 @@ function readModel(params: unknown): string | undefined {
   return typeof m === "string" && m.length > 0 ? m : undefined
 }
 
+/** `maxTokens` (maxTokens-passthrough plan, 2026-08-08): absent is valid
+ * (the api lane's own `DEFAULT_MAX_TOKENS` applies) and reported as
+ * `{ok: true, value: undefined}`, distinct from a PRESENT-but-malformed
+ * value (`{ok: false}`) — a non-integer or non-positive number is rejected
+ * at this wire boundary rather than silently coerced (e.g. `Math.trunc`ed
+ * or clamped to 1), matching `isWellFormedIsolation`'s own fail-closed
+ * discipline for `session/prompt`'s other fields rather than trusting
+ * whatever a caller sends. */
+function readMaxTokens(params: unknown): { ok: true; value: number | undefined } | { ok: false } {
+  const raw = (params as { _meta?: { kkamak?: { maxTokens?: unknown } } } | undefined)?._meta?.kkamak?.maxTokens
+  if (raw === undefined) return { ok: true, value: undefined }
+  if (typeof raw !== "number" || !Number.isInteger(raw) || raw <= 0) return { ok: false }
+  return { ok: true, value: raw }
+}
+
 /** Full structural validation against the `WarmIsolation` interface
  * (acp-wire.ts), field-for-field. A shallow `typeof iso === "object"` check
  * (the prior implementation) accepts `{}`, `[]`, and any partial object —
@@ -366,6 +381,20 @@ export function createDispatcher(
             )
             return
           }
+          // maxTokens-passthrough plan: a PRESENT-but-malformed value
+          // (non-integer, non-positive) means nothing CAN be pushed under
+          // it either — same law, same wire-boundary-rejection discipline
+          // as the sessionId/model check just above, not a silent coercion.
+          const maxTokensResult = readMaxTokens(params)
+          if (!maxTokensResult.ok) {
+            respondError(
+              ACP_ERR_NO_CALL,
+              "session/prompt _meta.kkamak.maxTokens must be a positive integer when present",
+              { callConsumed: false },
+            )
+            return
+          }
+          const maxTokens = maxTokensResult.value
           // An UNKNOWN sessionId (never minted by THIS daemon's session/new,
           // or already forgotten) is likewise a provable no-call — nothing
           // was ever spent under a session id nobody registered. Fixes the
@@ -413,7 +442,7 @@ export function createDispatcher(
             state.outstanding.set(sessionId, outstandingForSession)
             mayHaveConsumed = true
             try {
-              const outcome: TurnOutcome = await apiSession.oneShot(text, model, { recycle: false, tag })
+              const outcome: TurnOutcome = await apiSession.oneShot(text, model, { recycle: false, tag, maxTokens })
               respondOutcome(outcome, sessionId)
               return
             } finally {
@@ -424,6 +453,26 @@ export function createDispatcher(
                 if (remaining.length === 0) state.outstanding.delete(sessionId)
               }
             }
+          }
+
+          // maxTokens-passthrough plan, "the part that needs care": the
+          // agent (CLI) lane has no `max_tokens` equivalent — WarmSession's
+          // isolation set carries no such option. Silently ignoring a
+          // caller-set maxTokens here would reintroduce exactly the
+          // silent-behavior class this package has been burned by before
+          // (the retired KKAMAK_ACP_SOCKET, the unsignalled env override
+          // downstream) — so this REJECTS at the wire boundary instead of a
+          // non-throwing diagnostic: nothing has been sent to the pool yet
+          // (pool.acquire is still below this check), so it is a provable
+          // no-call, same law and same shape as every other pre-send
+          // refusal in this case.
+          if (maxTokens !== undefined) {
+            respondError(
+              ACP_ERR_NO_CALL,
+              `session/prompt maxTokens is not supported on the agent lane (model "${model}" routes to agent, not api)`,
+              { callConsumed: false },
+            )
+            return
           }
 
           const acquired = pool.acquire(session.isolation, Date.now())

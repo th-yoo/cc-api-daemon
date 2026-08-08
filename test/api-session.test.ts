@@ -159,6 +159,38 @@ describe("ApiSession — cross-client leak (singleton safety)", () => {
   })
 })
 
+// maxTokens passthrough (2026-08-08 plan): ApiSession.oneShot's own opts
+// forward verbatim to sendOne, per-turn — never stored on the instance, so
+// one turn's override cannot leak into the next turn's request body.
+describe("ApiSession — maxTokens passthrough", () => {
+  test("oneShot's maxTokens is forwarded verbatim into the request body", async () => {
+    const s = new ApiSession(stubEnv(), warmOpts())
+    respondWith({ content: [{ type: "text", text: "r" }], model: "claude-haiku-4-5" })
+    await s.oneShot("x", "claude-haiku-4-5", { recycle: false, maxTokens: 777 })
+    expect(lastRequestBody().max_tokens).toBe(777)
+    s.close()
+  })
+
+  test("omitted maxTokens -> the leaf's own default (2048), not undefined on the wire", async () => {
+    const s = new ApiSession(stubEnv(), warmOpts())
+    respondWith({ content: [{ type: "text", text: "r" }], model: "claude-haiku-4-5" })
+    await s.oneShot("x", "claude-haiku-4-5", { recycle: false })
+    expect(lastRequestBody().max_tokens).toBe(2_048)
+    s.close()
+  })
+
+  test("a per-turn override does not leak into the next turn's request", async () => {
+    const s = new ApiSession(stubEnv(), warmOpts())
+    respondWith({ content: [{ type: "text", text: "one" }], model: "claude-haiku-4-5" })
+    await s.oneShot("first", "claude-haiku-4-5", { recycle: false, maxTokens: 100 })
+    expect(lastRequestBody().max_tokens).toBe(100)
+    respondWith({ content: [{ type: "text", text: "two" }], model: "claude-haiku-4-5" })
+    await s.oneShot("second", "claude-haiku-4-5", { recycle: false })
+    expect(lastRequestBody().max_tokens).toBe(2_048)
+    s.close()
+  })
+})
+
 describe("ApiSession — cancel", () => {
   test("cancelling a queued turn is queued-dropped and settles no-call", async () => {
     const s = new ApiSession(stubEnv(), warmOpts())

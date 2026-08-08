@@ -314,6 +314,22 @@ describe("never rejects", () => {
 // ── 13. sendOne-specific: abort signal + caller-supplied history ───────────
 // New surface daemonCall never had — added for ApiSession's cancel/FIFO.
 
+// ── maxTokens passthrough (2026-08-08 plan) ────────────────────────────────
+
+describe("maxTokens", () => {
+  test("omitted -> body.max_tokens is the DEFAULT_MAX_TOKENS default (2048)", async () => {
+    setRespond(() => okBody("ok"))
+    await sendOne("hi", ALIAS_MODEL, apiKeyEnv(), { isolation: ISO })
+    expect(getCaptured()[0]!.body.max_tokens).toBe(2_048)
+  })
+
+  test("provided -> forwarded verbatim as body.max_tokens, not the default", async () => {
+    setRespond(() => okBody("ok"))
+    await sendOne("hi", ALIAS_MODEL, apiKeyEnv(), { isolation: ISO, maxTokens: 500 })
+    expect(getCaptured()[0]!.body.max_tokens).toBe(500)
+  })
+})
+
 describe("sendOne-specific", () => {
   test("an aborted request is call-consumed, never no-call", async () => {
     const ac = new AbortController()

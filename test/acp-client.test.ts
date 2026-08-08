@@ -239,6 +239,22 @@ describe("acp-client (fake daemons only — no CLI, no model)", () => {
     expect(params?.prompt[0]?.text).toBe(outgoing)
   })
 
+  test("maxTokens-passthrough: daemonCall carries opts.maxTokens on _meta.kkamak.maxTokens when provided", async () => {
+    const env = tempEnv("maxtokens")
+    const fake = await fakeDaemon(env, { fingerprint: envFingerprint(env), answer: "ok" })
+    LIVE_FAKES.push(fake)
+    await daemonCall("x", HAIKU, env, { ...ISO, maxTokens: 512 })
+    expect(fake.promptParams()?._meta.maxTokens).toBe(512)
+  })
+
+  test("maxTokens-passthrough: omitted -> no maxTokens field crosses the wire (byte-identical to a pre-maxTokens caller)", async () => {
+    const env = tempEnv("maxtokens-omitted")
+    const fake = await fakeDaemon(env, { fingerprint: envFingerprint(env), answer: "ok" })
+    LIVE_FAKES.push(fake)
+    await daemonCall("x", HAIKU, env, ISO)
+    expect(fake.promptParams()?._meta.maxTokens).toBeUndefined()
+  })
+
   test("N3c-iii test 7: daemonCall sends _meta.kkamak.isolation deep-equal to what the caller passed", async () => {
     const env = tempEnv("isolation")
     const fake = await fakeDaemon(env, { fingerprint: envFingerprint(env), answer: "ok" })

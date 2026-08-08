@@ -294,8 +294,16 @@ export interface AcpPromptParams {
   prompt: Array<{ type: "text"; text: string }>
   /** REQUIRED: the daemon never substitutes its own env's model for the
    * caller's — a silent substitution would make the record's `model` stamp
-   * a lie (§6e provenance rule). */
-  _meta: { kkamak: { model: string } }
+   * a lie (§6e provenance rule). `maxTokens` is ADDITIVE and OPTIONAL
+   * (maxTokens-passthrough plan, 2026-08-08): omitted, the api lane keeps
+   * its existing `DEFAULT_MAX_TOKENS` (call.ts) default of 2048, byte-
+   * identical to every caller that predates this field. Only the `api` lane
+   * (`ApiSession` -> `sendOne`) can honor it — the daemon rejects it at the
+   * wire boundary (ACP_ERR_NO_CALL) on a turn routed to the `agent` lane,
+   * since `WarmSession` has no `max_tokens` equivalent and silently
+   * dropping it would reintroduce the exact silent-behavior class this
+   * package has been burned by before. */
+  _meta: { kkamak: { model: string; maxTokens?: number } }
 }
 export interface AcpPromptResult {
   stopReason: "end_turn"

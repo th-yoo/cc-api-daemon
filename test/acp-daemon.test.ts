@@ -367,6 +367,56 @@ describe("acp-daemon wire behaviour (no model reached)", () => {
     c.close()
   }, DAEMON_TEST_TIMEOUT_MS)
 
+  // maxTokens-passthrough plan (2026-08-08): a PRESENT-but-malformed
+  // maxTokens is rejected at the wire boundary rather than silently
+  // coerced (e.g. truncated, clamped to 1, or the sign dropped) — same
+  // provable-no-call shape as the missing-model case above.
+  test.each([0, -1, 1.5, -100])(
+    "malformed _meta.kkamak.maxTokens (%p) -> ACP_ERR_NO_CALL with data.callConsumed false, and ZERO model calls",
+    async (badValue) => {
+      const e = tempEndpoint(`maxtokens-bad-${badValue}`); LIVE.push(e)
+      const cap = stubServer(() => sseText("SHOULD-NEVER-BE-CALLED"))
+      try {
+        const { env } = spawnDaemon(e.home, e.spawnLog, { ANTHROPIC_BASE_URL: cap.url })
+        await waitForSpawnLog(e.spawnLog, 1, 15_000)
+        const c = await connectNdjson(env)
+        await c.request("initialize", { protocolVersion: 1 })
+        const s = await c.request("session/new", { cwd: process.cwd(), mcpServers: [], _meta: { kkamak: { isolation: TEST_ISOLATION } } })
+        await expect(c.request("session/prompt", {
+          sessionId: s.sessionId,
+          prompt: [{ type: "text", text: "hi" }],
+          _meta: { kkamak: { model: HAIKU, maxTokens: badValue } },
+        })).rejects.toMatchObject({ code: ACP_ERR_NO_CALL, data: { callConsumed: false } })
+        expect(cap.captured.length).toBe(0)
+        c.close()
+      } finally { cap.stop() }
+    },
+    DAEMON_TEST_TIMEOUT_MS,
+  )
+
+  // "the part that needs care" (maxTokens-passthrough plan): WarmSession
+  // (the agent lane) has no max_tokens equivalent, so a caller-set
+  // maxTokens on a non-haiku turn must be REJECTED, not silently ignored —
+  // the judgment call this package made, documented in README.
+  test("maxTokens set on an agent-lane model -> ACP_ERR_NO_CALL naming the lane, and ZERO model calls", async () => {
+    const e = tempEndpoint("maxtokens-agent-lane"); LIVE.push(e)
+    const cap = stubServer(() => sseText("SHOULD-NEVER-BE-CALLED"))
+    try {
+      const { env } = spawnDaemon(e.home, e.spawnLog, { ANTHROPIC_BASE_URL: cap.url })
+      await waitForSpawnLog(e.spawnLog, 1, 15_000)
+      const c = await connectNdjson(env)
+      await c.request("initialize", { protocolVersion: 1 })
+      const s = await c.request("session/new", { cwd: process.cwd(), mcpServers: [], _meta: { kkamak: { isolation: TEST_ISOLATION } } })
+      await expect(c.request("session/prompt", {
+        sessionId: s.sessionId,
+        prompt: [{ type: "text", text: "hi" }],
+        _meta: { kkamak: { model: AGENT_TEST_MODEL, maxTokens: 500 } },
+      })).rejects.toMatchObject({ code: ACP_ERR_NO_CALL, data: { callConsumed: false } })
+      expect(cap.captured.length).toBe(0)
+      c.close()
+    } finally { cap.stop() }
+  }, DAEMON_TEST_TIMEOUT_MS)
+
   test("N3c-iii test 4: unknown sessionId -> ACP_ERR_NO_CALL with data.callConsumed false, and ZERO model calls", async () => {
     const e = tempEndpoint("unknownsession"); LIVE.push(e)
     const cap = stubServer(() => sseText("SHOULD-NEVER-BE-CALLED"))
@@ -701,11 +751,16 @@ function fakeDispatchPool() {
 class FakeDispatchApi implements DispatchableSession {
   readonly isolation: WarmIsolation
   private inflight = new Map<string, (o: TurnOutcome) => void>()
+  /** maxTokens-passthrough plan: the last oneShot() call's own maxTokens,
+   * for a test to assert the dispatcher actually forwarded it — mirrors
+   * `calls`' own "record what arrived, let the test assert" convention. */
+  lastMaxTokens: number | undefined
   constructor(private readonly calls: string[], isolation: WarmIsolation) { this.isolation = isolation }
   turnInFlight(): boolean { return this.inflight.size > 0 }
   close(): void { this.calls.push("close") }
-  oneShot(_text: string, _model: string, opts: { recycle: boolean; tag?: string }): Promise<TurnOutcome> {
+  oneShot(_text: string, _model: string, opts: { recycle: boolean; tag?: string; maxTokens?: number }): Promise<TurnOutcome> {
     const tag = opts.tag!
+    this.lastMaxTokens = opts.maxTokens
     this.calls.push(`oneShot:${tag}`)
     return new Promise<TurnOutcome>((resolve) => { this.inflight.set(tag, resolve) })
   }
@@ -776,6 +831,60 @@ describe("acp-daemon dispatcher — HAZARD 2/3 routing (fake pool + fake api fac
       result: { stopReason: "end_turn", _meta: { kkamak: { model: HAIKU, canonicalModel: HAIKU, callConsumed: true } } },
     })
     expect(instances.length).toBe(1)
+  })
+
+  test("maxTokens-passthrough: a haiku model's _meta.kkamak.maxTokens is forwarded to the api backend's oneShot", async () => {
+    const { pool } = fakeDispatchPool()
+    const { makeApiSession, calls: apiCalls, instances, settle } = fakeApiFactory()
+    const state = createDaemonState()
+    const S = "s-haiku-maxtokens"
+    state.sessions.set(S, { createdAt: Date.now(), isolation: TEST_ISOLATION })
+    const dispatch = createDispatcher(pool, state, "fp", {}, { makeApiSession })
+    const write = () => {}
+
+    const p = dispatch({ id: 1, method: "session/prompt", params: {
+      sessionId: S, prompt: [{ type: "text", text: "hi" }], _meta: { kkamak: { model: HAIKU, maxTokens: 333 } },
+    } }, write)
+    const tag = apiCalls.find((c) => c.startsWith("oneShot:"))!.split(":")[1]!
+    expect(instances[0]!.lastMaxTokens).toBe(333)
+    settle(tag, { kind: "no-call" })
+    await p
+  })
+
+  test("maxTokens-passthrough: omitted -> the api backend sees maxTokens undefined (its own default applies downstream)", async () => {
+    const { pool } = fakeDispatchPool()
+    const { makeApiSession, calls: apiCalls, instances, settle } = fakeApiFactory()
+    const state = createDaemonState()
+    const S = "s-haiku-no-maxtokens"
+    state.sessions.set(S, { createdAt: Date.now(), isolation: TEST_ISOLATION })
+    const dispatch = createDispatcher(pool, state, "fp", {}, { makeApiSession })
+    const write = () => {}
+
+    const p = dispatch({ id: 1, method: "session/prompt", params: {
+      sessionId: S, prompt: [{ type: "text", text: "hi" }], _meta: { kkamak: { model: HAIKU } },
+    } }, write)
+    const tag = apiCalls.find((c) => c.startsWith("oneShot:"))!.split(":")[1]!
+    expect(instances[0]!.lastMaxTokens).toBeUndefined()
+    settle(tag, { kind: "no-call" })
+    await p
+  })
+
+  test("maxTokens-passthrough: an agent-lane model with maxTokens set is refused before the pool is ever touched", async () => {
+    const { pool, calls: poolCalls } = fakeDispatchPool()
+    const { makeApiSession, calls: apiCalls } = fakeApiFactory()
+    const state = createDaemonState()
+    const S = "s-agent-maxtokens"
+    state.sessions.set(S, { createdAt: Date.now(), isolation: TEST_ISOLATION })
+    const dispatch = createDispatcher(pool, state, "fp", {}, { makeApiSession })
+    const frames: Array<Record<string, unknown>> = []
+    const write = (m: object) => frames.push(m as Record<string, unknown>)
+
+    await dispatch({ id: 1, method: "session/prompt", params: {
+      sessionId: S, prompt: [{ type: "text", text: "hi" }], _meta: { kkamak: { model: AGENT_TEST_MODEL, maxTokens: 100 } },
+    } }, write)
+    expect(frames.find((f) => f.id === 1)).toMatchObject({ error: { code: ACP_ERR_NO_CALL, data: { callConsumed: false } } })
+    expect(poolCalls.length).toBe(0)   // pool never touched at all
+    expect(apiCalls.length).toBe(0)
   })
 
   test("a non-haiku model still routes through the pool (agent lane), api factory never called", async () => {
@@ -1293,6 +1402,27 @@ describe.skipIf(GATE_FAST)("acp-daemon over unix socket (reaches the stubbed mod
       expect(typeof r._meta.kkamak.canonicalModel).toBe("string")
       expect(r._meta.kkamak.callConsumed).toBe(true)
       expect(updates.join("")).toContain("ANSWER")
+      c.close()
+    } finally { cap.stop() }
+  }, DAEMON_TEST_TIMEOUT_MS)
+
+  test("maxTokens-passthrough: _meta.kkamak.maxTokens reaches the real HTTP request body as max_tokens", async () => {
+    const e = tempEndpoint("maxtokens-e2e"); LIVE.push(e)
+    const cap = stubServer(() => okBody("ANSWER", STUB_DECLARED_MODEL))
+    try {
+      const { env } = spawnDaemon(e.home, e.spawnLog, { ANTHROPIC_BASE_URL: cap.url })
+      await waitForSpawnLog(e.spawnLog, 1, 15_000)
+      const c = await connectNdjson(env)
+      await c.request("initialize", { protocolVersion: 1 })
+      const s = await c.request("session/new", { cwd: process.cwd(), mcpServers: [], _meta: { kkamak: { isolation: TEST_ISOLATION } } })
+      const r = await c.request("session/prompt", {
+        sessionId: s.sessionId,
+        prompt: [{ type: "text", text: "hi" }],
+        _meta: { kkamak: { model: HAIKU, maxTokens: 256 } },
+      })
+      expect(r.stopReason).toBe("end_turn")
+      expect(cap.captured.length).toBe(1)
+      expect(cap.captured[0]!.body.max_tokens).toBe(256)
       c.close()
     } finally { cap.stop() }
   }, DAEMON_TEST_TIMEOUT_MS)
