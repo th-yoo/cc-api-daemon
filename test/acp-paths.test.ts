@@ -48,9 +48,20 @@ describe("acp-paths", () => {
     expect(envFingerprint({ A_KEY: "1", B_KEY: "2" })).toBe(envFingerprint({ A_KEY: "9", B_KEY: "9" }))
   })
   test("denylisted keys do not change the fingerprint", () => {
-    for (const k of ["PWD", "SHLVL", "TMUX_PANE", "KKAMAK_ACP_IDLE_MS", "KKAMAK_ACP_TEST_SPAWN_LOG"]) {
+    for (const k of [
+      "PWD", "SHLVL", "TMUX_PANE",
+      "KKAMAK_ACP_IDLE_MS", "KKAMAK_ACP_TEST_SPAWN_LOG",
+      "ACP_IDLE_MS", "ACP_TEST_SPAWN_LOG",
+    ]) {
       expect(ACP_ENV_DENYLIST.includes(k)).toBe(true)
       expect(envFingerprint({ [k]: "x" })).toBe(envFingerprint({ [k]: "y" }))
+    }
+  })
+  test("CRITICAL: ACP_TEST_MARKER (and its legacy spelling) is NOT denylisted — a test fork must get its own fingerprint", () => {
+    for (const k of ["ACP_TEST_MARKER", "KKAMAK_ACP_TEST_MARKER"]) {
+      expect(ACP_ENV_DENYLIST.includes(k)).toBe(false)
+      expect(envFingerprint({ [k]: "fork-a" })).not.toBe(envFingerprint({ [k]: "fork-b" }))
+      expect(envFingerprint({ [k]: "fork-a" })).not.toBe(envFingerprint({}))
     }
   })
   test("ROUND-4 I4: lane SELECTION and the ENDPOINT ADDRESS are denylisted", () => {
@@ -71,14 +82,26 @@ describe("acp-paths", () => {
     expect(envFingerprint({ KKAMAK_ACP_SOCKET: "/tmp/a.sock" }))
       .toBe(envFingerprint({ KKAMAK_ACP_SOCKET: "/tmp/b.sock" }))
   })
-  test("ROUND-4 I4: the TURN BUDGET is an instrument parameter and is NOT denylisted", () => {
+  test("ROUND-4 I4: the TURN BUDGET is an instrument parameter and is NOT denylisted (either spelling)", () => {
     // It changes when a generation is cut off, hence which turns produce a
     // derivation. A daemon running a different turn budget is a different
     // instrument and must not be adopted by a client expecting the
     // registered one.
     expect(ACP_ENV_DENYLIST.includes("KKAMAK_ACP_TURN_TIMEOUT_MS")).toBe(false)
+    expect(ACP_ENV_DENYLIST.includes("ACP_TURN_TIMEOUT_MS")).toBe(false)
     expect(envFingerprint({ KKAMAK_ACP_TURN_TIMEOUT_MS: "9000" }))
       .not.toBe(envFingerprint({ KKAMAK_ACP_TURN_TIMEOUT_MS: "20000" }))
+    // Safe direction, asserted: the two spellings of the SAME value get
+    // DIFFERENT fingerprints (over-isolation), so aliasing never lets two
+    // differently-spelled-but-equal-valued processes share a daemon.
+    expect(envFingerprint({ ACP_TURN_TIMEOUT_MS: "9000" }))
+      .not.toBe(envFingerprint({ KKAMAK_ACP_TURN_TIMEOUT_MS: "9000" }))
+  })
+  test("the SESSION CAP is an instrument parameter and is NOT denylisted (either spelling)", () => {
+    expect(ACP_ENV_DENYLIST.includes("KKAMAK_ACP_MAX_SESSIONS")).toBe(false)
+    expect(ACP_ENV_DENYLIST.includes("ACP_MAX_SESSIONS")).toBe(false)
+    expect(envFingerprint({ ACP_MAX_SESSIONS: "4" }))
+      .not.toBe(envFingerprint({ KKAMAK_ACP_MAX_SESSIONS: "4" }))
   })
   test("key ORDER in the object does not change the fingerprint (keys are sorted)", () => {
     expect(envFingerprint({ A: "1", B: "2" })).toBe(envFingerprint({ B: "2", A: "1" }))

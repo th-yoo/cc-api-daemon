@@ -37,16 +37,32 @@ import path from "node:path"
  *        — and since daemonCall never spawns, that is not "one extra
  *        daemon", it is a silent 100% fallback on every record forever.
  *
- * NOT here, deliberately: KKAMAK_ACP_TURN_TIMEOUT_MS. It changes when a
- * generation is cut off, hence which turns produce a derivation, hence the
- * instrument. A daemon running a different turn budget must not be adopted
- * by a client expecting the registered one. */
+ * NOT here, deliberately: (KKAMAK_)ACP_TURN_TIMEOUT_MS, (KKAMAK_)ACP_MAX_SESSIONS.
+ * They change when a generation is cut off / how many sessions a pool
+ * admits, hence which turns produce a derivation, hence the instrument. A
+ * daemon running a different budget must not be adopted by a client
+ * expecting the registered one — so two processes setting the same value
+ * under different spellings (old vs. new) deliberately get DIFFERENT
+ * fingerprints and cannot share a daemon. Safe direction (over-isolation,
+ * not cross-talk); pinned by test/acp-paths.test.ts.
+ *
+ * Also NOT here, deliberately: (KKAMAK_)ACP_TEST_MARKER. Being outside the
+ * denylist is the mechanism by which a test forks a distinct fingerprint
+ * from the live host — denylisting it would collapse any env without a
+ * HOME override onto the host fingerprint, letting a test fake overwrite
+ * (and on stop() delete) the running host daemon's discovery file.
+ *
+ * The denylist is a FIXED list, not host-extensible: the daemon is a
+ * separate process spawned as bare `bun <acp-daemon.ts>` carrying only env,
+ * fingerprinting off this module-level constant. Any in-process extension
+ * the client applied couldn't reach the daemon — the two would compute
+ * different fingerprints and never rendezvous. */
 export const ACP_ENV_DENYLIST: readonly string[] = [
   "_", "PWD", "OLDPWD", "SHLVL", "RANDOM", "LINES", "COLUMNS", "WINDOWID",
   "TERM_SESSION_ID", "ITERM_SESSION_ID", "TMUX", "TMUX_PANE", "STY",
   "SSH_AUTH_SOCK", "SSH_AGENT_PID", "SSH_CLIENT", "SSH_CONNECTION", "SSH_TTY",
   "XDG_SESSION_ID", "DBUS_SESSION_BUS_ADDRESS",
-  "KKAMAK_ACP_IDLE_MS", "KKAMAK_ACP_TEST_SPAWN_LOG",
+  "KKAMAK_ACP_IDLE_MS", "KKAMAK_ACP_TEST_SPAWN_LOG", "ACP_IDLE_MS", "ACP_TEST_SPAWN_LOG",
   "KKAMAK_ACP_SOCKET", "KKAMAK_GAUGE_TRANSPORT",
 ]
 

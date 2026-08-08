@@ -91,10 +91,11 @@ import {
 import { validateJsonRpc, createErrorResponse, JSON_RPC_PARSE_ERROR } from "./jsonrpc.ts"
 import { listModels } from "./models.ts"
 
-/** Production idle budget: 15 minutes. `KKAMAK_ACP_IDLE_MS` overrides for
- * tests (a few seconds) — acp-paths.ts's denylist note is explicit that
- * this is a daemon OPERATING parameter, not an instrument parameter, so it
- * never enters the fingerprint. */
+/** Production idle budget: 15 minutes. `ACP_IDLE_MS` (legacy
+ * `KKAMAK_ACP_IDLE_MS` still honored) overrides for tests (a few seconds) —
+ * acp-paths.ts's denylist note is explicit that this is a daemon OPERATING
+ * parameter, not an instrument parameter, so it never enters the
+ * fingerprint (both spellings are denylisted for exactly that reason). */
 const DEFAULT_IDLE_MS = 900_000
 
 type Write = (msg: object) => void
@@ -435,7 +436,7 @@ export function createDispatcher(
             // keys its classification on; the code here is diagnostic).
             respondError(
               -32002,
-              "no warm session available (KKAMAK_ACP_MAX_SESSIONS reached)",
+              "no warm session available (ACP_MAX_SESSIONS reached)",
               { callConsumed: false },
             )
             return
@@ -611,7 +612,7 @@ export function createDispatcher(
 // N3c-iii: the direct `new WarmSession(env, warmBudgetOpts(env))` + its
 // env-overridable `turnTimeoutMs` leg are GONE from this file — SessionPool
 // (acp-pool.ts) now owns budget construction for every WarmSession it spawns,
-// including honoring `KKAMAK_ACP_TURN_TIMEOUT_MS` itself (mirrored
+// including honoring `ACP_TURN_TIMEOUT_MS` itself (mirrored
 // byte-for-byte off this file's old `warmBudgetOpts`, acp-pool.ts's
 // `parseTurnTimeoutMs`), so a `new SessionPool(env)` here is a complete
 // replacement, not an approximation.
@@ -691,7 +692,7 @@ async function runServer(
 ): Promise<void> {
   const bindLock = bindLockPath(env)
   const fingerprint = envFingerprint(env)
-  const idleMs = Number(env.KKAMAK_ACP_IDLE_MS) || DEFAULT_IDLE_MS
+  const idleMs = Number(env.ACP_IDLE_MS ?? env.KKAMAK_ACP_IDLE_MS) || DEFAULT_IDLE_MS
 
   // Stale-discovery takeover, race-free: the WHOLE probe→bind sequence
   // below runs while holding the bind lock. MAY throw (EACCES on an
@@ -787,9 +788,10 @@ async function runServer(
   // Test seam: exactly one line here means exactly one daemon is serving.
   // Written AFTER bind+publish succeed — never at boot — so a starter that
   // lost the bind race (exited above) writes nothing.
-  if (env.KKAMAK_ACP_TEST_SPAWN_LOG) {
+  const testSpawnLog = env.ACP_TEST_SPAWN_LOG ?? env.KKAMAK_ACP_TEST_SPAWN_LOG
+  if (testSpawnLog) {
     try {
-      fs.appendFileSync(env.KKAMAK_ACP_TEST_SPAWN_LOG, `${process.pid} ${new Date().toISOString()}\n`)
+      fs.appendFileSync(testSpawnLog, `${process.pid} ${new Date().toISOString()}\n`)
     } catch { /* best-effort */ }
   }
 
@@ -850,7 +852,7 @@ async function runServer(
     process.exit(code)
   }
 
-  // A fixed 60s tick could never observe a short KKAMAK_ACP_IDLE_MS (tests
+  // A fixed 60s tick could never observe a short ACP_IDLE_MS (tests
   // use 1.5-8s) and would make the reaper untestable.
   const tickMs = Math.max(250, Math.min(60_000, idleMs / 3))
   reaper = setInterval(() => {

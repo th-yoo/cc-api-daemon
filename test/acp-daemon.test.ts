@@ -331,6 +331,28 @@ describe("acp-daemon wire behaviour (no model reached)", () => {
     } finally { cap.stop() }
   }, DAEMON_TEST_TIMEOUT_MS)
 
+  // A2: ACP_TEST_SPAWN_LOG (new spelling) alone — no KKAMAK_ACP_TEST_SPAWN_LOG
+  // at all — still makes the daemon write its post-listen line. Spawned
+  // directly rather than through the spawnDaemon()/buildDaemonEnv() helpers,
+  // which always set the legacy spelling for every other test's teardown.
+  test("ACP_TEST_SPAWN_LOG (new spelling) alone makes the daemon write its post-listen line", async () => {
+    const e = tempEndpoint("spawnlog-new-spelling"); LIVE.push(e)
+    const env = buildDaemonEnv(e.home, e.spawnLog)
+    delete (env as Record<string, string | undefined>).KKAMAK_ACP_TEST_SPAWN_LOG
+    env.ACP_TEST_SPAWN_LOG = e.spawnLog
+    const daemon = path.join(import.meta.dir, "..", "src", "acp-daemon.ts")
+    const quoted = ["bun", daemon].map((c) => `'${c.replace(/'/g, `'\\''`)}'`).join(" ")
+    const proc = Bun.spawn(["bash", "-c", `nohup ${quoted} </dev/null >/dev/null 2>&1 &`], {
+      env, stdout: "ignore", stderr: "ignore",
+    })
+    proc.unref()
+    const lines = await waitForSpawnLog(e.spawnLog, 1, 15_000)
+    expect(lines.length).toBeGreaterThanOrEqual(1)
+    const c = await connectNdjson(env)
+    await c.request("initialize", { protocolVersion: 1 })
+    c.close()
+  }, DAEMON_TEST_TIMEOUT_MS)
+
   test("N3c-iii test 5: session/new without isolation -> -32602, and no session is recorded", async () => {
     const e = tempEndpoint("newnoiso"); LIVE.push(e)
     const { env } = spawnDaemon(e.home, e.spawnLog)
@@ -442,6 +464,22 @@ describe("acp-daemon wire behaviour (no model reached)", () => {
     // mkdtemp'd dir, never removed by the daemon); what the daemon's
     // shutdown deletes is the discovery entry underneath it.
     expect(readDiscovery(env)).toBeUndefined()
+  }, DAEMON_TEST_TIMEOUT_MS)
+
+  // A2: ACP_IDLE_MS is the new spelling; KKAMAK_ACP_IDLE_MS keeps working.
+  // Here the legacy spelling carries the PRODUCTION (15 min) budget while
+  // the new spelling carries the short test budget — the reaper firing
+  // quickly proves ACP_IDLE_MS won, not KKAMAK_ACP_IDLE_MS.
+  test("ACP_IDLE_MS (new spelling) wins over KKAMAK_ACP_IDLE_MS when both are set", async () => {
+    const e = tempEndpoint("idle-new-spelling"); LIVE.push(e)
+    const { env } = spawnDaemon(e.home, e.spawnLog, { ACP_IDLE_MS: "1500" }, "900000")
+    const lines = await waitForSpawnLog(e.spawnLog, 1, 15_000)
+    const pid = Number(lines[0]?.trim().split(/\s+/)[0])
+    const c = await connectNdjson(env)
+    await c.request("initialize", { protocolVersion: 1 })
+    c.close()
+    const gone = await until(() => { try { process.kill(pid, 0); return false } catch { return true } }, 8_000)
+    expect(gone).toBe(true)
   }, DAEMON_TEST_TIMEOUT_MS)
 
   // websocket-transport swap: "a dead FILE at the socket path" has no

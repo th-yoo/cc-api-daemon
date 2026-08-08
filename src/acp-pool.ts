@@ -67,17 +67,18 @@ interface InternalEntry extends PoolEntry {
  * reachable via the env override below rather than a raised default). A
  * different host (see CLAUDE.md's cross-host note) needs its own
  * measurement before trusting this number — the doc's method travels, the
- * number does not. Env-tunable via KKAMAK_ACP_MAX_SESSIONS — see
- * `parseMaxSessions` for the exact parsing rule. */
+ * number does not. Env-tunable via ACP_MAX_SESSIONS (KKAMAK_ACP_MAX_SESSIONS
+ * still honored) — see `parseMaxSessions` for the exact parsing rule. */
 const DEFAULT_MAX_SESSIONS = 4
 
 /** Mirrors acp-daemon.ts's own `DEFAULT_IDLE_MS` (15 min production idle
  * budget for its singleton WarmSession). The pool has no opinion beyond
  * that precedent; the daemon (next node) may pass a shorter value, same as
- * it does today via KKAMAK_ACP_IDLE_MS. */
+ * it does today via ACP_IDLE_MS (KKAMAK_ACP_IDLE_MS still honored). */
 const DEFAULT_SESSION_IDLE_MS = 900_000
 
-/** Parse `KKAMAK_ACP_MAX_SESSIONS` from the given env (never `process.env`
+/** Parse `ACP_MAX_SESSIONS` (or the legacy `KKAMAK_ACP_MAX_SESSIONS`) from
+ * the given env (never `process.env`
  * directly — the pool's env is passed explicitly by its constructor, same
  * discipline as the rest of the ACP lane). Chosen rule, stated because the
  * brief requires it: absent OR not a finite number (garbage, e.g. "abc")
@@ -86,7 +87,7 @@ const DEFAULT_SESSION_IDLE_MS = 900_000
  * least one session — while a garbage string is DEFAULTED, not clamped,
  * since there is no number to clamp). */
 function parseMaxSessions(env: Record<string, string | undefined>): number {
-  const raw = env.KKAMAK_ACP_MAX_SESSIONS
+  const raw = env.ACP_MAX_SESSIONS ?? env.KKAMAK_ACP_MAX_SESSIONS
   if (raw === undefined) return DEFAULT_MAX_SESSIONS
   const n = Number(raw)
   if (!Number.isFinite(n)) return DEFAULT_MAX_SESSIONS
@@ -94,18 +95,19 @@ function parseMaxSessions(env: Record<string, string | undefined>): number {
 }
 
 /** N3c-iii ruling (2026-08-04, reopening this file): the pool owns
- * `KKAMAK_ACP_TURN_TIMEOUT_MS`, not a daemon-side factory — the same class
- * of env-driven construction policy as `KKAMAK_ACP_MAX_SESSIONS` above, and
- * a fingerprint-pinned instrument knob (acp-paths.test.ts:69-71). A
- * daemon-side `makeSession` override was considered and rejected: it would
- * split budget construction into two authorities (pool default vs. daemon
- * factory), the exact divergence class the explicit-budgets rule (every leg
- * named here, never left to a caller's own defaulting) exists to prevent.
+ * `ACP_TURN_TIMEOUT_MS` (legacy `KKAMAK_ACP_TURN_TIMEOUT_MS` still honored),
+ * not a daemon-side factory — the same class of env-driven construction
+ * policy as `ACP_MAX_SESSIONS` above, and a fingerprint-pinned instrument
+ * knob (acp-paths.test.ts:69-71). A daemon-side `makeSession` override was
+ * considered and rejected: it would split budget construction into two
+ * authorities (pool default vs. daemon factory), the exact divergence class
+ * the explicit-budgets rule (every leg named here, never left to a caller's
+ * own defaulting) exists to prevent.
  *
  * EXPORTED (api-sdk merge brief Task 4, HAZARD 2): the daemon's per-session
  * `ApiSession` is deliberately NEVER pooled, so it cannot reuse the pool's
  * OWN `WarmConstructOpts` construction — but the knob itself
- * (`KKAMAK_ACP_TURN_TIMEOUT_MS`) is an instrument-wide setting, not a
+ * (`ACP_TURN_TIMEOUT_MS`) is an instrument-wide setting, not a
  * pool-specific one, so `acp-daemon.ts` reuses this exact function for its
  * own unpooled construction rather than re-deriving the same env-parsing
  * rule a second time. This is the ONE function shared between the two
@@ -124,7 +126,7 @@ function parseMaxSessions(env: Record<string, string | undefined>): number {
  * re-validating here would be a second, potentially divergent authority
  * on the exact same floor. */
 export function parseTurnTimeoutMs(env: Record<string, string | undefined>): number {
-  return Number(env.KKAMAK_ACP_TURN_TIMEOUT_MS) || ACP_BUDGET.turnTimeoutMs
+  return Number(env.ACP_TURN_TIMEOUT_MS ?? env.KKAMAK_ACP_TURN_TIMEOUT_MS) || ACP_BUDGET.turnTimeoutMs
 }
 
 /** Recursive sorted-keys canonicalization, so two separately-constructed

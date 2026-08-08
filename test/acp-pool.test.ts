@@ -242,6 +242,21 @@ describe("KKAMAK_ACP_MAX_SESSIONS parsing (6)", () => {
     for (let i = 0; i < 4; i++) expect(pool.acquire(TEST_ISOLATION, t0).ok).toBe(true)
     expect(pool.acquire(TEST_ISOLATION, t0)).toEqual({ ok: false, reason: "pool-exhausted" })
   })
+
+  test("A2: ACP_MAX_SESSIONS (new spelling) is honored, and wins over KKAMAK_ACP_MAX_SESSIONS when both are set", () => {
+    const newOnly = new SessionPool({ ...ENV, ACP_MAX_SESSIONS: "2" }, { makeSession: fakeMakeSession })
+    const t0 = Date.now()
+    expect(newOnly.acquire(TEST_ISOLATION, t0).ok).toBe(true)
+    expect(newOnly.acquire(TEST_ISOLATION, t0).ok).toBe(true)
+    expect(newOnly.acquire(TEST_ISOLATION, t0)).toEqual({ ok: false, reason: "pool-exhausted" })
+
+    const bothSet = new SessionPool(
+      { ...ENV, ACP_MAX_SESSIONS: "1", KKAMAK_ACP_MAX_SESSIONS: "4" },
+      { makeSession: fakeMakeSession },
+    )
+    expect(bothSet.acquire(TEST_ISOLATION, t0).ok).toBe(true)
+    expect(bothSet.acquire(TEST_ISOLATION, t0)).toEqual({ ok: false, reason: "pool-exhausted" })
+  })
 })
 
 describe("SessionPool.reap (7)", () => {
@@ -453,6 +468,22 @@ describe("SessionPool.acquire — explicit makeSession budget legs", () => {
     const a = absent.acquire(TEST_ISOLATION, now)
     expect(a.ok).toBe(true)
     if (a.ok) expect(asFake(a.entry.warm).opts.turnTimeoutMs).toBe(ACP_BUDGET.turnTimeoutMs)
+  })
+
+  test("A2: ACP_TURN_TIMEOUT_MS (new spelling) is honored, and wins over KKAMAK_ACP_TURN_TIMEOUT_MS when both are set", () => {
+    const newOnly = new SessionPool({ ...ENV, ACP_TURN_TIMEOUT_MS: "22222" }, { makeSession: fakeMakeSession })
+    const now = Date.now()
+    const n = newOnly.acquire(TEST_ISOLATION, now)
+    expect(n.ok).toBe(true)
+    if (n.ok) expect(asFake(n.entry.warm).opts.turnTimeoutMs).toBe(22222)
+
+    const bothSet = new SessionPool(
+      { ...ENV, ACP_TURN_TIMEOUT_MS: "33333", KKAMAK_ACP_TURN_TIMEOUT_MS: "12345" },
+      { makeSession: fakeMakeSession },
+    )
+    const b = bothSet.acquire(TEST_ISOLATION, now)
+    expect(b.ok).toBe(true)
+    if (b.ok) expect(asFake(b.entry.warm).opts.turnTimeoutMs).toBe(33333)
   })
 })
 
