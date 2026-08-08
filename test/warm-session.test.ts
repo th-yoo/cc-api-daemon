@@ -17,7 +17,7 @@
 // clock budgets — is unchanged from the source.
 import { describe, expect, test } from "bun:test"
 import { WarmSession, selectEvidence } from "../src/warm-session.ts"
-import { modelProvenBy, CLI_SPAWN_BUDGET_MS, GAUGE_ISOLATION } from "../src/acp-wire.ts"
+import { modelProvenBy, CLI_SPAWN_BUDGET_MS, GAUGE_ISOLATION, DEFAULT_ISOLATION } from "../src/acp-wire.ts"
 import { sseText, hangFirstServer, until, warmHermeticEnv } from "./agent-cli-stub.ts"
 import { stubServer } from "./sdk-stub.ts"
 import { GATE_FAST } from "./helpers.ts"
@@ -346,9 +346,10 @@ describe("CLI credential-precedence guard (Task 6/7 — ALWAYS runs, never gated
   }, CLI_TEST_TIMEOUT_MS)
 })
 
-// WarmSession takes an `isolation` option, defaulting to GAUGE_ISOLATION.
-// Neither test below spawns the CLI — WarmSession's constructor never
-// calls ensure()/query().
+// WarmSession takes an `isolation` option, defaulting to DEFAULT_ISOLATION
+// (neutral, package-owned — NOT the kkamak-branded GAUGE_ISOLATION, which
+// stays internal for its one outside consumer). Neither test below spawns
+// the CLI — WarmSession's constructor never calls ensure()/query().
 describe("WarmSession isolation option (construction only, no CLI spawn)", () => {
   test("GAUGE_ISOLATION is the §6d set, field for field", () => {
     expect(GAUGE_ISOLATION).toEqual({
@@ -363,9 +364,22 @@ describe("WarmSession isolation option (construction only, no CLI spawn)", () =>
     })
   })
 
-  test("the DEFAULT isolation is the gauge one — omitting the option changes nothing", () => {
+  test("DEFAULT_ISOLATION is neutral, field for field", () => {
+    expect(DEFAULT_ISOLATION).toEqual({
+      systemPrompt: "",
+      settingSources: [],
+      settings: { autoMemoryEnabled: false },
+      persistSession: false,
+      strictMcpConfig: true,
+      tools: [],
+      title: "acp-warm",
+      thinking: { type: "disabled" },
+    })
+  })
+
+  test("the DEFAULT isolation is the neutral one — omitting the option changes nothing", () => {
     const ws = new WarmSession({})
-    expect(ws.isolation).toEqual(GAUGE_ISOLATION)
+    expect(ws.isolation).toEqual(DEFAULT_ISOLATION)
     ws.close()
   })
 })

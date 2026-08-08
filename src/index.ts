@@ -33,8 +33,11 @@ export { ApiSession } from "./api-session.ts"
 export { WarmSession } from "./warm-session.ts"
 
 /** Isolation is a VALUE that crosses the wire on session/new, not an id.
- * This package ships no isolation constant — that is caller-side policy. */
+ * `DEFAULT_ISOLATION` is the neutral profile `WarmSession` falls back to
+ * when a caller omits `isolation` entirely — exported so a consumer can
+ * name what it's getting instead of inheriting an unnameable default. */
 export type { WarmIsolation } from "./acp-wire.ts"
+export { DEFAULT_ISOLATION } from "./acp-wire.ts"
 
 /** Model-identity check over what the wire actually reported. */
 export { modelProvenBy } from "./acp-wire.ts"

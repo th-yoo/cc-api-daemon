@@ -22,7 +22,7 @@
 // below is erased and costs nothing.
 import os from "node:os"
 import type { Query, SDKMessage, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk"
-import { ACP_BUDGET, CLI_SPAWN_BUDGET_MS, GAUGE_ISOLATION, type WarmIsolation, modelProvenBy } from "./acp-wire.ts"
+import { ACP_BUDGET, CLI_SPAWN_BUDGET_MS, DEFAULT_ISOLATION, type WarmIsolation, modelProvenBy } from "./acp-wire.ts"
 
 export type TurnOutcome =
   | { kind: "ok"; text: string; model: string; canonicalModel: string }
@@ -264,7 +264,7 @@ export class WarmSession {
     this.setModelMs = opts.setModelMs ?? ACP_BUDGET.setModelMs
     this.hardGraceMs = opts.hardGraceMs ?? ACP_BUDGET.hardGraceMs
     this.cwd = opts.cwd ?? os.tmpdir()
-    this.isolation = opts.isolation ?? GAUGE_ISOLATION
+    this.isolation = opts.isolation ?? DEFAULT_ISOLATION
   }
 
   oneShot(messageText: string, model: string, opts: { recycle: boolean; tag?: string }): Promise<TurnOutcome> {
@@ -466,15 +466,13 @@ export class WarmSession {
       const feed = new Pushable()
       const q = query({
         prompt: feed.stream(),
-        // this.isolation defaults to GAUGE_ISOLATION (acp-wire.ts), the
-        // tested, shared §6d/§6e isolation set (review finding 4,
-        // 2026-08-04) — acp-wire.test.ts locks its value AND proves it is
-        // as-const-safe to spread into an SDK options literal. Every
-        // existing caller constructs WarmSession without `isolation`, so
-        // this spread is byte-identical to the GAUGE_ISOLATION literal that
-        // was inlined here before (S0). A caller that DOES pass `isolation`
-        // (e.g. a `reasoning` profile) gets its own policy without
-        // disturbing the gauge lane.
+        // this.isolation defaults to DEFAULT_ISOLATION (acp-wire.ts), a
+        // neutral, unbranded profile — a caller that constructs WarmSession
+        // without `isolation` gets a nameable default it can import and
+        // compare against, not another project's identity (GAUGE_ISOLATION,
+        // kept internal — see acp-wire.ts). A caller that DOES pass
+        // `isolation` (e.g. a `reasoning` profile, or GAUGE_ISOLATION's own
+        // consumer) gets its own policy without disturbing this default.
         options: { ...this.isolation, model, cwd: this.cwd, env: subprocessEnv },
       })
       if (this.closed) {                       // closed during construction

@@ -208,7 +208,9 @@ export interface WarmIsolation {
 /** The §6d/§6e gauge isolation set — byte-identical to the option literal
  * currently inlined in agent-transport.ts's agentSdkCall (see :119-132
  * there for the authority). A later node proves that equality with a
- * test. */
+ * test. Internal only: its one outside consumer (meta-harness) imports it
+ * from its own local copy, which stays there — do NOT re-export this from
+ * index.ts, that would add permanent kkamak surface for nothing. */
 export const GAUGE_ISOLATION: WarmIsolation = {
   systemPrompt: "",
   settingSources: [],
@@ -217,6 +219,22 @@ export const GAUGE_ISOLATION: WarmIsolation = {
   strictMcpConfig: true,
   tools: [],
   title: "kkamak-gauge",
+  thinking: { type: "disabled" },
+}
+
+/** The neutral default isolation set for a bare `new WarmSession(env)` with
+ * no `isolation` passed. Same shape as GAUGE_ISOLATION, minus the
+ * project-identifying title — a consumer that omits `isolation` should get
+ * an unbranded profile it can name, not another project's identity by
+ * accident. */
+export const DEFAULT_ISOLATION: WarmIsolation = {
+  systemPrompt: "",
+  settingSources: [],
+  settings: { autoMemoryEnabled: false },
+  persistSession: false,
+  strictMcpConfig: true,
+  tools: [],
+  title: "acp-warm",
   thinking: { type: "disabled" },
 }
 
