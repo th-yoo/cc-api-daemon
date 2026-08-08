@@ -546,12 +546,13 @@ describe("acp-daemon wire behaviour (no model reached)", () => {
   }, DAEMON_TEST_TIMEOUT_MS)
 })
 
-// ── kkamak/models/list: stateless model enumeration. Reaches a stub of the
-// Models API (GET /v1/models), never messages.create -- no session/new, no
-// pool, no ApiSession, on every test below. Zero real spend: the stub
+// ── acp/models/list (A3: renamed from kkamak/models/list; the daemon
+// accepts BOTH spellings): stateless model enumeration. Reaches a stub of
+// the Models API (GET /v1/models), never messages.create -- no session/new,
+// no pool, no ApiSession, on every test below. Zero real spend: the stub
 // terminates the HTTP leg locally, same discipline as every other
 // real-daemon describe block in this file.
-describe("acp-daemon dispatcher — kkamak/models/list", () => {
+describe("acp-daemon dispatcher — acp/models/list", () => {
   const MODEL_A = {
     type: "model" as const,
     id: "claude-haiku-4-5-20251001",
@@ -576,7 +577,7 @@ describe("acp-daemon dispatcher — kkamak/models/list", () => {
     return { url: `http://127.0.0.1:${server.port}`, stop: () => server.stop(true) }
   }
 
-  test("ok: returns ModelInfo[] verbatim, with NO session/new ever called", async () => {
+  test("ok: returns ModelInfo[] verbatim, with NO session/new ever called — both the new and legacy method spellings work against the SAME daemon", async () => {
     const e = tempEndpoint("models-ok"); LIVE.push(e)
     const cap = modelsStub(() => pageBody([MODEL_A]))
     try {
@@ -584,10 +585,15 @@ describe("acp-daemon dispatcher — kkamak/models/list", () => {
       await waitForSpawnLog(e.spawnLog, 1, 15_000)
       const c = await connectNdjson(env)
       await c.request("initialize", { protocolVersion: 1 })
-      // Deliberately no session/new call at all -- kkamak/models/list is
+      // Deliberately no session/new call at all -- acp/models/list is
       // stateless metadata, callable right after initialize.
-      const models = await c.request("kkamak/models/list")
+      const models = await c.request("acp/models/list")
       expect(models).toEqual([MODEL_A])
+      // A3: the ORIGINAL kkamak-namespaced spelling is still accepted by
+      // this same running daemon — a second `case` in the dispatcher, not a
+      // separate mechanism.
+      const legacyModels = await c.request("kkamak/models/list")
+      expect(legacyModels).toEqual([MODEL_A])
       c.close()
     } finally { cap.stop() }
   }, DAEMON_TEST_TIMEOUT_MS)
@@ -602,7 +608,7 @@ describe("acp-daemon dispatcher — kkamak/models/list", () => {
     await waitForSpawnLog(e.spawnLog, 1, 15_000)
     const c = await connectNdjson(env)
     await c.request("initialize", { protocolVersion: 1 })
-    await expect(c.request("kkamak/models/list")).rejects.toMatchObject({ code: -32004 })
+    await expect(c.request("acp/models/list")).rejects.toMatchObject({ code: -32004 })
     c.close()
   }, DAEMON_TEST_TIMEOUT_MS)
 
@@ -614,7 +620,7 @@ describe("acp-daemon dispatcher — kkamak/models/list", () => {
       await waitForSpawnLog(e.spawnLog, 1, 15_000)
       const c = await connectNdjson(env)
       await c.request("initialize", { protocolVersion: 1 })
-      await expect(c.request("kkamak/models/list")).rejects.toMatchObject({ code: -32005, data: { status: 500 } })
+      await expect(c.request("acp/models/list")).rejects.toMatchObject({ code: -32005, data: { status: 500 } })
       c.close()
     } finally { cap.stop() }
   }, DAEMON_TEST_TIMEOUT_MS)

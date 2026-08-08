@@ -54,18 +54,24 @@ export const ACP_SESSION_UPDATE = "session/update"
  * a no-op by spec, same as `session/cancel`'s own ack. */
 export const ACP_SESSION_CLOSE = "session/close"
 
-/** Model enumeration. Namespaced `kkamak/models/list`, NOT `models/list` —
- * the extensibility rule this file already applies to `_meta` fields (see
- * the comment above `AcpInitializeResult` below) reasons identically about
- * method NAMES: ACP has `session/*` today and could plausibly add
- * `models/*` tomorrow (agents do have models), so a bare `models/list`
- * would squat on a name the spec might reserve. Stateless metadata, not a
- * turn: no session/new, no pool acquire, no ApiSession involvement —
- * callable any time after `initialize`, answered directly by the
- * dispatcher. Wraps `models.ts`'s `listModels`, itself a direct,
- * unbilled `GET /v1/models` — see the error codes below for why that
- * means it does NOT reuse ACP_ERR_NO_CALL/ACP_ERR_CALL_CONSUMED. */
-export const ACP_MODELS_LIST = "kkamak/models/list"
+/** Model enumeration. Namespaced `acp/models/list`, NOT a bare
+ * `models/list` — the extensibility rule this file already applies to
+ * `_meta` fields (see the comment above `AcpInitializeResult` below)
+ * reasons identically about method NAMES: ACP has `session/*` today and
+ * could plausibly add `models/*` tomorrow (agents do have models), so a
+ * bare `models/list` would squat on a name the spec might reserve.
+ * Stateless metadata, not a turn: no session/new, no pool acquire, no
+ * ApiSession involvement — callable any time after `initialize`, answered
+ * directly by the dispatcher. Wraps `models.ts`'s `listModels`, itself a
+ * direct, unbilled `GET /v1/models` — see the error codes below for why
+ * that means it does NOT reuse ACP_ERR_NO_CALL/ACP_ERR_CALL_CONSUMED.
+ *
+ * `ACP_MODELS_LIST_LEGACY` is the original kkamak-namespaced spelling — the
+ * daemon accepts BOTH (acp-daemon.ts dispatcher), so a caller pinned to the
+ * old name keeps working. Nothing in src/ still SENDS the legacy spelling;
+ * it exists purely as an accepted input. */
+export const ACP_MODELS_LIST = "acp/models/list"
+export const ACP_MODELS_LIST_LEGACY = "kkamak/models/list"
 
 /** §6e law L1/L4 — the prompt bytes never crossed the boundary toward the
  * model. The caller MAY fall back to the one-shot lane without breaking

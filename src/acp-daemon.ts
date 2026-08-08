@@ -83,7 +83,7 @@ import {
 import {
   FrameDecoder, encodeFrame,
   ACP_INITIALIZE, ACP_SESSION_NEW, ACP_SESSION_PROMPT, ACP_SESSION_CANCEL, ACP_SESSION_UPDATE,
-  ACP_SESSION_CLOSE, ACP_MODELS_LIST,
+  ACP_SESSION_CLOSE, ACP_MODELS_LIST, ACP_MODELS_LIST_LEGACY,
   ACP_ERR_NO_CALL, ACP_ERR_CALL_CONSUMED, ACP_ERR_MODELS_NO_AUTH, ACP_ERR_MODELS_UPSTREAM_ERROR,
   ACP_BUDGET,
   type WarmIsolation,
@@ -562,6 +562,7 @@ export function createDispatcher(
           return
         }
 
+        case ACP_MODELS_LIST_LEGACY:
         case ACP_MODELS_LIST: {
           // Stateless metadata, not a turn: no session/new, no pool.acquire,
           // no ApiSession — answered directly. budgetMs omitted deliberately:
