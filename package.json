@@ -1,6 +1,6 @@
 {
   "name": "@th-yoo/cc-api-daemon",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "license": "MIT",
   "description": "ACP daemon over localhost WebSocket: JSON-RPC, session pool, dual backend (@anthropic-ai/sdk direct calls or @anthropic-ai/claude-agent-sdk warm CLI)",
