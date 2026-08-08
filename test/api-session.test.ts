@@ -128,7 +128,7 @@ describe("ApiSession — oneShot + FIFO", () => {
 })
 
 // Step 3a: singleton safety, NOT skippable. This daemon is a singleton
-// shared by every kkamak instance with the same env fingerprint; the pool
+// shared by every client with the same env fingerprint; the pool
 // hands one idle isolation-equal entry to whichever client asks next, and
 // ApiSession.history IS the literal messages array — a missed recycle puts
 // another client's prompts and replies into THIS client's HTTP request body

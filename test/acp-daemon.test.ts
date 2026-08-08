@@ -132,7 +132,7 @@ const HAIKU_OBSERVED_KEY = HAIKU
  * files, both spawn/bind locks, and the daemon's spawn-log all live under
  * it (acp-paths.ts's discoveryPath consults `env.HOME` explicitly, ahead
  * of the real host's `os.homedir()`, for exactly this isolation seam) — so
- * NO TEST EVER TOUCHES the real host's `~/.config/kkamak/`, without an
+ * NO TEST EVER TOUCHES the real host's `~/.config/acpd/`, without an
  * afterEach hygiene assertion needing to check for it: killDaemon below
  * just removes the whole throwaway HOME. */
 function tempEndpoint(tag: string) {
@@ -149,8 +149,9 @@ function tempEndpoint(tag: string) {
  * different discovery file echoing a different fingerprint — mutual
  * refusal forever.
  *
- * KKAMAK_ACP_IDLE_MS is ALWAYS set to a few seconds here (round-4 M8): the
- * production default is 900 000 ms, and a test daemon that survives an
+ * ACP_IDLE_MS (still set here under its legacy spelling, KKAMAK_ACP_IDLE_MS —
+ * see buildDaemonEnv below) is ALWAYS set to a few seconds here (round-4 M8):
+ * the production default is 900 000 ms, and a test daemon that survives an
  * afterEach failure would sit on the host for fifteen minutes. */
 /** Extracted so a test can compute the EXACT env a daemon will be spawned
  * with BEFORE actually spawning it — needed to seed a stale discovery

@@ -195,7 +195,7 @@ describe("SessionPool.acquire — cap", () => {
   })
 })
 
-describe("KKAMAK_ACP_MAX_SESSIONS parsing (6)", () => {
+describe("ACP_MAX_SESSIONS parsing (6)", () => {
   test("'2' is honored — a 3rd concurrent acquire is refused", () => {
     const pool = new SessionPool({ ...ENV, KKAMAK_ACP_MAX_SESSIONS: "2" }, { makeSession: fakeMakeSession })
     const t0 = Date.now()
@@ -434,15 +434,16 @@ describe("SessionPool.acquire — explicit makeSession budget legs", () => {
   })
 
   // N3c-iii ruling (2026-08-04): the pool, not a daemon-side factory, owns
-  // KKAMAK_ACP_TURN_TIMEOUT_MS — same class of env-driven construction
-  // policy as KKAMAK_ACP_MAX_SESSIONS, and a fingerprint-pinned instrument
-  // knob (acp-paths.test.ts:69-71). Mirrors acp-daemon.ts's warmBudgetOpts
-  // EXACTLY: `Number(env.KKAMAK_ACP_TURN_TIMEOUT_MS) || ACP_BUDGET.turnTimeoutMs`
+  // ACP_TURN_TIMEOUT_MS (legacy KKAMAK_ACP_TURN_TIMEOUT_MS still honored) —
+  // same class of env-driven construction policy as ACP_MAX_SESSIONS, and a
+  // fingerprint-pinned instrument knob (acp-paths.test.ts:69-71). Mirrors
+  // acp-daemon.ts's warmBudgetOpts EXACTLY:
+  // `Number(env.ACP_TURN_TIMEOUT_MS ?? env.KKAMAK_ACP_TURN_TIMEOUT_MS) || ACP_BUDGET.turnTimeoutMs`
   // — absent, "0", or non-numeric garbage all fall through the `||` to the
   // raw constant (test 11 above already pins the absent case; this pins the
   // override case, and 0/garbage explicitly, so the two together cover the
   // whole function).
-  test("12. env.KKAMAK_ACP_TURN_TIMEOUT_MS overrides turnTimeoutMs exactly like warmBudgetOpts; 0/garbage/absent all fall back to the raw ACP_BUDGET constant", () => {
+  test("12. env.KKAMAK_ACP_TURN_TIMEOUT_MS (legacy spelling) overrides turnTimeoutMs exactly like warmBudgetOpts; 0/garbage/absent all fall back to the raw ACP_BUDGET constant", () => {
     const overridden = new SessionPool(
       { ...ENV, KKAMAK_ACP_TURN_TIMEOUT_MS: "12345" },
       { makeSession: fakeMakeSession },

@@ -58,7 +58,7 @@ function tempHome(tag: string): string {
 }
 
 /** Every test builds its OWN throwaway HOME dir under tmpdir — no test may
- * ever touch the real host's `~/.config/kkamak/` (discoveryPath consults
+ * ever touch the real host's `~/.config/acpd/` (discoveryPath consults
  * `env.HOME` explicitly, ahead of the real host's `os.homedir()`, for
  * exactly this isolation seam). */
 function tempEnv(tag: string, extra: Record<string, string | undefined> = {}): Record<string, string | undefined> {
@@ -374,7 +374,7 @@ describe("acp-client (fake daemons only — no CLI, no model)", () => {
     // failure surface now is acquireAcpLock -> tryCreateLock's own
     // mkdirSync, which throws EACCES when the discovery/lock directory's
     // PARENT is unwritable. A HOME sitting under a 0500 (no write)
-    // directory reproduces that: `${restricted}/home/.config/kkamak/`
+    // directory reproduces that: `${restricted}/home/.config/acpd/`
     // cannot be created because `restricted` itself refuses the write.
     const restricted = fs.mkdtempSync(path.join(tmpdir(), "c-restricted-"))
     fs.chmodSync(restricted, 0o500)

@@ -11,7 +11,7 @@ import {
 } from "../src/acp-paths.ts"
 
 /** Every test builds its OWN path under tmpdir. NO TEST MAY EVER TOUCH
- * ~/.config/kkamak/ — this file only exercises path/hash/lock logic against
+ * ~/.config/acpd/ — this file only exercises path/hash/lock logic against
  * temp files, never the real default discoveryPath() (i.e. never calls it
  * without an explicit env.HOME override). */
 function tempPath(tag: string): string {
