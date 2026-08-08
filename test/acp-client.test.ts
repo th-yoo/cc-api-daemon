@@ -31,6 +31,8 @@ import { ACP_BUDGET, modelProvenBy, type WarmIsolation } from "../src/acp-wire.t
 import { envFingerprint, spawnLockPath, tryCreateLock, readDiscovery } from "../src/acp-paths.ts"
 import { fakeDaemon } from "./acp-fake-daemon.ts"
 import { stubServer, okResponse } from "./sdk-stub.ts"
+import { LIVE_HOMES, tempHome, tempEnv, cleanupTempHomes } from "./temp-home.ts"
+import { LIVE_DAEMONS, killDaemonByPid, waitForLines, reapDaemons } from "./daemon-reap.ts"
 
 const HAIKU = "claude-haiku-4-5"
 // Replaces the gauge's own GAUGE_ISOLATION, which was caller-side and this
@@ -51,54 +53,17 @@ const TEST_ISOLATION: WarmIsolation = {
 }
 const ISO = { isolation: TEST_ISOLATION }
 
-const LIVE_HOMES: string[] = []
-
-function tempHome(tag: string): string {
-  return fs.mkdtempSync(path.join(tmpdir(), `c-${tag}-`))
-}
-
-/** Every test builds its OWN throwaway HOME dir under tmpdir — no test may
- * ever touch the real host's `~/.config/acpd/` (discoveryPath consults
- * `env.HOME` explicitly, ahead of the real host's `os.homedir()`, for
- * exactly this isolation seam). */
-function tempEnv(tag: string, extra: Record<string, string | undefined> = {}): Record<string, string | undefined> {
-  const home = tempHome(tag)
-  LIVE_HOMES.push(home)
-  return { ...process.env, KKAMAK_ACP_TEST_MARKER: "acp-client-test", HOME: home, ...extra }
-}
-
+// tempHome/tempEnv/LIVE_HOMES/cleanupTempHomes and killDaemonByPid/
+// waitForLines/LIVE_DAEMONS/reapDaemons live in temp-home.ts/daemon-reap.ts
+// (A6.1) — extracted so they're importable outside a test runner (this
+// file itself keeps its own `afterEach`, unchanged below).
 const LIVE_FAKES: Array<{ stop: () => void }> = []
-const LIVE_DAEMONS: Array<{ spawnLog: string }> = []
-
-/** Read the POST-LISTEN pids out of the spawn log and SIGTERM each one.
- * Pid-scoped, never `pkill -f` — §6e forbids host-wide teardown (round-4
- * I9). Removing the daemon's OWN files (discovery, both locks, spawn log)
- * is handled generically by the LIVE_HOMES sweep below — they all live
- * under the same throwaway HOME this daemon was given. */
-function killDaemonByPid(spawnLog: string): void {
-  try {
-    for (const line of fs.readFileSync(spawnLog, "utf-8").split("\n")) {
-      const pid = Number(line.trim().split(/\s+/)[0])
-      if (Number.isInteger(pid) && pid > 0) { try { process.kill(pid, "SIGTERM") } catch { /* gone */ } }
-    }
-  } catch { /* never listened */ }
-}
 
 afterEach(() => {
   while (LIVE_FAKES.length) { const f = LIVE_FAKES.pop()!; try { f.stop() } catch { /* ignore */ } }
-  while (LIVE_DAEMONS.length) { const d = LIVE_DAEMONS.pop()!; killDaemonByPid(d.spawnLog) }
-  while (LIVE_HOMES.length) { const h = LIVE_HOMES.pop()!; try { fs.rmSync(h, { recursive: true, force: true }) } catch { /* ignore */ } }
+  reapDaemons()
+  cleanupTempHomes()
 })
-
-async function waitForLines(file: string, n: number, ms: number): Promise<string[]> {
-  const deadline = Date.now() + ms
-  for (;;) {
-    let lines: string[] = []
-    try { lines = fs.readFileSync(file, "utf-8").split("\n").filter((l) => l.trim()) } catch { /* not yet */ }
-    if (lines.length >= n || Date.now() > deadline) return lines
-    await new Promise((r) => setTimeout(r, 50))
-  }
-}
 
 describe("acp-client (fake daemons only — no CLI, no model)", () => {
   test("law L1: no daemon at all -> no-call, fast", async () => {
@@ -440,10 +405,7 @@ describe("acp-client e2e (real daemon + stub)", () => {
       cap.stop()
     }
     // SIGTERM by PID from the spawn log (never pkill -f, §6e / round-4 I9).
-    for (const line of fs.readFileSync(spawnLog, "utf-8").split("\n")) {
-      const pid = Number(line.trim().split(/\s+/)[0])
-      if (Number.isInteger(pid) && pid > 0) { try { process.kill(pid, "SIGTERM") } catch { /* gone */ } }
-    }
+    killDaemonByPid(spawnLog)
     const gone = await (async () => {
       const deadline = Date.now() + 5_000
       while (Date.now() < deadline) {
@@ -483,9 +445,6 @@ describe("acp-client e2e (real daemon + stub)", () => {
     } finally {
       cap.stop()
     }
-    for (const line of fs.readFileSync(spawnLog, "utf-8").split("\n")) {
-      const pid = Number(line.trim().split(/\s+/)[0])
-      if (Number.isInteger(pid) && pid > 0) { try { process.kill(pid, "SIGTERM") } catch { /* gone */ } }
-    }
+    killDaemonByPid(spawnLog)
   }, 60_000)
 })
