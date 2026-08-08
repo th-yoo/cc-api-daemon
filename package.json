@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "type": "module",
   "license": "MIT",
-  "description": "Single-process @anthropic-ai/sdk twin of the kkamak ACP warm-lane client surface",
+  "description": "ACP daemon over localhost WebSocket: JSON-RPC, session pool, dual backend (@anthropic-ai/sdk direct calls or @anthropic-ai/claude-agent-sdk warm CLI)",
   "exports": {
     ".": "./src/index.ts"
   },
