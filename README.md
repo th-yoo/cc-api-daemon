@@ -329,6 +329,19 @@ bundled in here.
 
 ## Known limitations
 
+- **The wire is not fully neutral: `_meta.kkamak` stays `_meta.kkamak`.**
+  Phase A (env vars, the discovery directory, `kkamak/models/list`) dropped
+  kkamak's name from everything it safely could — but every ACP frame's
+  custom field is still namespaced `_meta.kkamak.*`
+  (`{ _meta: { kkamak: { isolation, model, ... } } }`), not renamed to
+  something neutral. This is deliberate, not an oversight: the client both
+  writes and reads this key, and the daemon emits it on every response —
+  renaming it changes nothing about the env-derived fingerprint or discovery
+  path, so an old client and a new daemon would still rendezvous on the same
+  discovery file and then fail the `initialize` echo check, a **permanent
+  silent no-call** across any version skew. A correct rename needs daemon
+  and client changed in lockstep, accepting and emitting both keys, for zero
+  user-visible benefit — so it's held, not attempted, this round.
 - `canonicalModel === model` on the **`api` lane only** — the raw API
   exposes exactly one identity field, so `call.ts` sets both from
   `response.model` and `modelProvenBy`'s `canonicalModel` branch never
