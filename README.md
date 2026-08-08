@@ -280,25 +280,30 @@ switch (one.kind) {
 partial-success arm; a failure partway through a multi-page walk discards
 what was collected and returns `error`.
 
-### `kkamak/models/list` — model enumeration ON THE WIRE
+### `acp/models/list` — model enumeration ON THE WIRE
 
 `listModels`/`retrieveModel` above are direct SDK calls — no daemon
-involved at all, one process's own credentials. `kkamak/models/list` is the
-same capability reachable *through* the daemon, over the socket, for a
-caller that only speaks ACP and has no direct access to this process's own
-`listModels` import:
+involved at all, one process's own credentials. `acp/models/list` is the
+same capability reachable *through* the daemon, over the WebSocket
+connection, for a caller that only speaks ACP and has no direct access to
+this process's own `listModels` import:
 
 ```
---> {"jsonrpc":"2.0","id":1,"method":"kkamak/models/list"}
+--> {"jsonrpc":"2.0","id":1,"method":"acp/models/list"}
 <-- {"jsonrpc":"2.0","id":1,"result":[{"id":"claude-haiku-4-5-20251001", ...}]}
 ```
 
 Stateless metadata, not a turn — callable any time after `initialize`, no
 `session/new` needed. `result` is `ModelInfo[]` verbatim (the daemon is a
 pipe here, not a curator, matching `listModels`'s own re-export-don't-trim
-choice). Namespaced `kkamak/models/list`, not `models/list` — see
+choice). Namespaced `acp/models/list`, not a bare `models/list` — see
 `src/acp-wire.ts`'s own comment above `ACP_MODELS_LIST` for why a bare
 `models/*` would squat on a name ACP itself might reserve.
+
+**Back-compat**: the daemon also still accepts the original
+`kkamak/models/list` spelling (`ACP_MODELS_LIST_LEGACY` in `src/acp-wire.ts`)
+— a caller pinned to the old name keeps working. Nothing in this package
+sends that spelling anymore; it's accepted input only.
 
 **Credential boundary**: results come from the *daemon's* resolved
 credentials, never the caller's — a client learns what the daemon can see,
@@ -322,7 +327,7 @@ means "pool exhausted" on `session/prompt` in this daemon):
 
 Not yet done, on purpose: **no caching**. Model lists are near-static and
 this is a plausible place to cache a response for a short TTL, but this
-first cut ships uncached — every `kkamak/models/list` call is a real
+first cut ships uncached — every `acp/models/list` call is a real
 `GET /v1/models` round-trip. Add caching later as its own deliberate
 change if the extra latency/request volume becomes a real cost, not
 bundled in here.
@@ -330,7 +335,7 @@ bundled in here.
 ## Known limitations
 
 - **The wire is not fully neutral: `_meta.kkamak` stays `_meta.kkamak`.**
-  Phase A (env vars, the discovery directory, `kkamak/models/list`) dropped
+  Phase A (env vars, the discovery directory, `acp/models/list`) dropped
   kkamak's name from everything it safely could — but every ACP frame's
   custom field is still namespaced `_meta.kkamak.*`
   (`{ _meta: { kkamak: { isolation, model, ... } } }`), not renamed to
