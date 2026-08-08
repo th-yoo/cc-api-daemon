@@ -1,5 +1,5 @@
 {
-  "check": "KKAMAK_GATE_FAST=1 bun test",
+  "check": "ACP_GATE_FAST=1 bun test",
   "rounds": 2,
   "gauge": false
 }

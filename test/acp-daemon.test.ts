@@ -1256,7 +1256,7 @@ describe("acp-daemon dispatcher — session/close", () => {
 // Task 7 (gate-split): SessionPool's default backend is WarmSession since
 // this repo's own Task 5, so most of this block's daemon spawns ALSO spawn
 // a real `claude` CLI subprocess underneath (AGENT_TEST_MODEL turns) —
-// SLOW lane, skipped under KKAMAK_GATE_FAST=1 (gate.json's own `check`); a
+// SLOW lane, skipped under ACP_GATE_FAST=1 (gate.json's own `check`); a
 // bare `bun test` always runs it.
 describe.skipIf(GATE_FAST)("acp-daemon over unix socket (reaches the stubbed model)", () => {
   test("initialize -> session/new -> session/prompt round-trip, fingerprint and PROVEN-model evidence echoed", async () => {

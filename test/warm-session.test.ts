@@ -85,7 +85,7 @@ describe("selectEvidence (§6e model-evidence selection, pure -- no CLI, no stub
 
 // Task 7 (gate-split): SLOW lane — each test here pays a real `claude` CLI
 // subprocess spawn (measured 1.25-1.46s, some paths twice on
-// respawn/hard-reset). Skipped under KKAMAK_GATE_FAST=1 (gate.json's own
+// respawn/hard-reset). Skipped under ACP_GATE_FAST=1 (gate.json's own
 // `check`); a bare `bun test` (default, everywhere else) always runs it.
 // The credential-precedence guard is deliberately NOT in this block — see
 // its own describe below, which is exempt on purpose.
@@ -317,7 +317,7 @@ describe.skipIf(GATE_FAST)("WarmSession (spawns bundled CLI, hermetic — fake A
 // that stops running this one test on every Stop is a gate that stops
 // guarding the thing most worth guarding in a PUBLIC repo. Measured cost:
 // ~1s — the fast lane pays it deliberately.
-describe("CLI credential-precedence guard (Task 6/7 — ALWAYS runs, never gated by KKAMAK_GATE_FAST)", () => {
+describe("CLI credential-precedence guard (Task 6/7 — ALWAYS runs, never gated by ACP_GATE_FAST)", () => {
   test("warmHermeticEnv makes the spawned CLI present the fake key, never a bearer token — locks the credential-precedence claim this whole hermetic test file rests on", async () => {
     // Load-bearing regression lock (Task 6): this file's own header claims
     // the spawned CLI honors an explicit ANTHROPIC_API_KEY over on-disk/

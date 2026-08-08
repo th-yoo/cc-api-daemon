@@ -16,17 +16,18 @@ import path from "node:path"
 import type { WarmIsolation } from "../src/acp-wire.ts"
 
 /** Task 7 gate-split flag. ONE exported constant, read here and nowhere
- * else — three separate `process.env.KKAMAK_GATE_FAST` reads across three
+ * else — three separate `process.env.ACP_GATE_FAST` reads across three
  * test files is three chances to drift, and a drifted copy silently
  * under-tests (the exact failure shape CLAUDE.md rule 4 warns about,
  * though this is a different thing: an explicit, checked-in performance
  * flag, not a host-credential gate — see CLAUDE.md's "Credential safety"
  * section for the distinction). OPT-OUT polarity: unset (bare `bun test`)
- * runs everything; only `KKAMAK_GATE_FAST=1`, set in gate.json's own
- * `check` string, skips the slow (real `claude` CLI subprocess spawn)
- * blocks. `describe.skipIf` reports a skip count visibly in bun:test's own
- * output — never a silent absence. */
-export const GATE_FAST = process.env.KKAMAK_GATE_FAST === "1"
+ * runs everything; only `ACP_GATE_FAST=1` (legacy `KKAMAK_GATE_FAST=1`
+ * still honored — A2/A7's env-var aliasing pattern applied here too), set
+ * in gate.json's own `check` string, skips the slow (real `claude` CLI
+ * subprocess spawn) blocks. `describe.skipIf` reports a skip count visibly
+ * in bun:test's own output — never a silent absence. */
+export const GATE_FAST = process.env.ACP_GATE_FAST === "1" || process.env.KKAMAK_GATE_FAST === "1"
 
 export interface CapturedReq {
   headers: Headers

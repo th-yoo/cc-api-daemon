@@ -100,7 +100,8 @@ below exists to make that structurally hard, not just discouraged.
    credentials (nothing in this package currently does), it needs its own
    clearly-named opt-in, not a silent skip.
 
-   **Not the same thing, worth telling apart**: `KKAMAK_GATE_FAST=1`
+   **Not the same thing, worth telling apart**: `ACP_GATE_FAST=1` (legacy
+   `KKAMAK_GATE_FAST=1` still honored)
    (Task 7) `describe.skipIf`s the real-`claude`-CLI-subprocess-spawning
    blocks (`test/warm-session.test.ts`'s "spawns bundled CLI" and "a custom
    isolation reaches the wire", `test/acp-daemon.test.ts`'s "reaches the

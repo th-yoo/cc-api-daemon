@@ -116,7 +116,7 @@ contains no credential code; the spawned `claude` CLI resolves its own,
 honoring an explicit `ANTHROPIC_API_KEY` over on-disk/keychain credentials.
 That precedence is empirical, so it is regression-locked by a test that runs
 on every gate invocation (`test/warm-session.test.ts`'s credential-precedence
-guard, deliberately exempt from `KKAMAK_GATE_FAST`) — a silent CLI-side flip
+guard, deliberately exempt from `ACP_GATE_FAST`) — a silent CLI-side flip
 would otherwise leak a real OAuth token to a localhost stub with nothing
 raising an alarm. The env that matters is whichever
 one first spawned the daemon: `Bun.spawn`'s `env` option *replaces* the
