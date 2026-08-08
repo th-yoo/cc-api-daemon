@@ -128,7 +128,14 @@ export function daemonCall(
   outgoingText: string,
   model: string,
   env: Record<string, string | undefined>,
-  opts: { isolation: WarmIsolation; budgetMs?: number },
+  // `maxTokens` (maxTokens-passthrough plan, 2026-08-08): ADDITIVE and
+  // OPTIONAL, existing callers unaffected. Carried on `session/prompt`'s
+  // `_meta.kkamak` (below), the same convention already used for `model` —
+  // no second metadata channel. NOT validated client-side: the daemon is
+  // the wire boundary that owns validation for every other `session/prompt`
+  // field (`sessionId`, `model`, `isolation`), and this follows the same
+  // discipline rather than duplicating it here.
+  opts: { isolation: WarmIsolation; budgetMs?: number; maxTokens?: number },
 ): Promise<DaemonOutcome> {
   const budgetMs = opts.budgetMs ?? ACP_BUDGET.clientBudgetMs
   const fp = envFingerprint(env)
@@ -271,7 +278,10 @@ export function daemonCall(
         params: {
           sessionId,
           prompt: [{ type: "text", text: outgoingText }],
-          _meta: { kkamak: { model } },
+          // `maxTokens: undefined` is dropped by JSON.stringify below, so a
+          // caller that omits it sends the byte-identical frame it always
+          // has — the wire only ever carries the field when set.
+          _meta: { kkamak: { model, maxTokens: opts.maxTokens } },
         } satisfies AcpPromptParams,
       }
       const respPromise = new Promise<unknown>((res, rej) => pending.set(id, { resolve: res, reject: rej }))

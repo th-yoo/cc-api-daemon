@@ -16,6 +16,10 @@ interface PendingTurn {
   text: string
   model: string
   tag: string | undefined
+  /** ADDITIVE and OPTIONAL (maxTokens-passthrough plan): forwarded verbatim
+   * to `sendOne`'s own `opts.maxTokens`, which defaults to 2048 when
+   * undefined. This backend's own leaf, unlike WarmSession's CLI lane. */
+  maxTokens: number | undefined
   /** THE §6e send boundary. True once messages.create has been ENTERED for
    * this turn. `consumed(t) === t.sent` — the whole classification. */
   sent: boolean
@@ -74,13 +78,17 @@ export class ApiSession implements DispatchableSession {
     this.history = []
   }
 
-  oneShot(messageText: string, model: string, opts: { recycle: boolean; tag?: string }): Promise<TurnOutcome> {
+  oneShot(
+    messageText: string,
+    model: string,
+    opts: { recycle: boolean; tag?: string; maxTokens?: number },
+  ): Promise<TurnOutcome> {
     return new Promise<TurnOutcome>((resolve) => {
       if (this.closed) { resolve({ kind: "no-call" }); return }
       if (opts.recycle) this.history = []
       let settled = false
       const turn: PendingTurn = {
-        text: messageText, model, tag: opts.tag, sent: false, dropped: false,
+        text: messageText, model, tag: opts.tag, maxTokens: opts.maxTokens, sent: false, dropped: false,
         controller: undefined,
         settle: (o) => { if (!settled) { settled = true; resolve(o) } },
       }
@@ -120,6 +128,7 @@ export class ApiSession implements DispatchableSession {
         const outcome = await sendOne(turn.text, turn.model, this.env, {
           isolation: this.isolation,
           budgetMs: this.turnTimeoutMs,
+          maxTokens: turn.maxTokens,
           authDeps: this.authDeps,
           signal: controller.signal,
           messages,

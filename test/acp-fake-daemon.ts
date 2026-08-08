@@ -72,7 +72,7 @@ export interface FakeDaemonOpts {
 export interface FakePromptParams {
   sessionId: string
   prompt: Array<{ type: "text"; text: string }>
-  _meta: { model: string }
+  _meta: { model: string; maxTokens?: number }
 }
 
 export interface FakeSessionNewParams {
@@ -211,10 +211,11 @@ export async function fakeDaemon(env: Record<string, string | undefined>, opts: 
         }
         case ACP_SESSION_PROMPT: {
           sawPromptFlag = true
-          const p = params as { sessionId?: unknown; prompt?: Array<{ type: "text"; text: string }>; _meta?: { kkamak?: { model?: unknown } } } | undefined
+          const p = params as { sessionId?: unknown; prompt?: Array<{ type: "text"; text: string }>; _meta?: { kkamak?: { model?: unknown; maxTokens?: unknown } } } | undefined
           const sessionId = typeof p?.sessionId === "string" ? p.sessionId : ""
           const requestedModel = typeof p?._meta?.kkamak?.model === "string" ? p._meta.kkamak.model : ""
-          captured = { sessionId, prompt: p?.prompt ?? [], _meta: { model: requestedModel } }
+          const requestedMaxTokens = typeof p?._meta?.kkamak?.maxTokens === "number" ? p._meta.kkamak.maxTokens : undefined
+          captured = { sessionId, prompt: p?.prompt ?? [], _meta: { model: requestedModel, maxTokens: requestedMaxTokens } }
           if (id === undefined) break
           respondPrompt(write, id, sessionId, requestedModel)
           break

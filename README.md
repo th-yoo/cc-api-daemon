@@ -205,6 +205,42 @@ Consequences worth knowing before you pick a model:
   pool exists for `WarmSession`, which is what `makeSession` defaults to
   (`src/acp-pool.ts`).
 
+### `maxTokens` — output length cap (`api` lane only)
+
+`daemonCall`'s `opts` accepts an optional `maxTokens`, threaded through
+`session/prompt`'s `_meta.kkamak.maxTokens` to the `api` lane's own
+`sendOne`, which already capped every call at `DEFAULT_MAX_TOKENS` (2048)
+with no way for a caller to raise or lower it:
+
+```ts
+const outcome = await daemonCall("...", "claude-haiku-4-5", process.env, {
+  isolation,
+  maxTokens: 8_000, // omit to keep the 2048 default
+})
+```
+
+- **Additive and optional.** Omitted, behavior is byte-identical to before
+  this option existed — the wire frame doesn't even carry the field
+  (`JSON.stringify` drops an `undefined` value), and the `api` lane keeps
+  its 2048 default.
+- **Validated at the wire boundary, never coerced.** The daemon
+  (`acp-daemon.ts`) rejects a present-but-malformed value — non-integer or
+  non-positive — with `ACP_ERR_NO_CALL` (`data.callConsumed: false`)
+  rather than silently truncating, clamping, or flooring it to something
+  "close enough."
+- **Rejected outright on the `agent` lane, not silently dropped.**
+  `WarmSession` (the CLI lane) has no `max_tokens` equivalent — the
+  Agent SDK doesn't expose one — so a caller setting `maxTokens` on a
+  sonnet/opus/fable turn gets `ACP_ERR_NO_CALL` naming the lane, the same
+  provable-no-call shape as every other pre-send `session/prompt`
+  refusal, instead of the value quietly having no effect. This was a
+  judgment call between two defensible options (reject vs. a non-throwing
+  diagnostic naming the lane); reject won because this package has been
+  burned by silent-drop behavior before (the retired `KKAMAK_ACP_SOCKET`,
+  an unsignalled env override downstream) and every other malformed-input
+  case on `session/prompt` already fails closed the same way, rather than
+  logging and continuing — one discipline, not two.
+
 ### `.system` — local system-prompt prefix
 
 If a gitignored `.system` file exists at the daemon's cwd, its contents are

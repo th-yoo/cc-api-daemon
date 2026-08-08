@@ -27,7 +27,13 @@ export type CancelResult = "queued-dropped" | "unsent-dropped" | "interrupted" |
  * closeAll); `oneShot` and `cancel` are called only by whoever acquired the
  * entry, which from the pool onward is the daemon. */
 export interface DispatchableSession extends WarmSessionLike {
-  oneShot(messageText: string, model: string, opts: { recycle: boolean; tag?: string }): Promise<TurnOutcome>
+  /** `maxTokens` (maxTokens-passthrough plan, 2026-08-08) is ADDITIVE and
+   * OPTIONAL, and only `ApiSession` acts on it — forwarded to `sendOne`'s
+   * existing `opts.maxTokens`. `WarmSession` never receives a defined value
+   * here: the dispatcher (`acp-daemon.ts`) rejects `maxTokens` at the wire
+   * boundary before ever routing a turn to the agent lane, since
+   * `WarmSession` has no `max_tokens` equivalent to forward it to. */
+  oneShot(messageText: string, model: string, opts: { recycle: boolean; tag?: string; maxTokens?: number }): Promise<TurnOutcome>
   cancel(tag: string): CancelResult
   readonly isolation: WarmIsolation
 }
