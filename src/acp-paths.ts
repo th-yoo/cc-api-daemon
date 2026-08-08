@@ -107,7 +107,7 @@ export function envFingerprint(env: Record<string, string | undefined>): string 
 export function discoveryPath(env: Record<string, string | undefined>): string {
   const home = env.HOME || os.homedir()
   const fp = envFingerprint(env)
-  return path.join(home, ".config", "kkamak", `acp-${fp}.json`)
+  return path.join(home, ".config", "acpd", `acp-${fp}.json`)
 }
 
 export interface DiscoveryInfo {

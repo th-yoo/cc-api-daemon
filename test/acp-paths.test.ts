@@ -122,6 +122,11 @@ describe("acp-paths", () => {
     const p = discoveryPath({ HOME: "/nonexistent/fake-home" })
     expect(p.startsWith("/nonexistent/fake-home")).toBe(true)
   })
+  test("A4: the discovery dir is ~/.config/acpd/, not the old ~/.config/kkamak/ — no fallback read of the old location", () => {
+    const p = discoveryPath({ HOME: "/nonexistent/fake-home" })
+    expect(p).toBe(path.join("/nonexistent/fake-home", ".config", "acpd", `acp-${envFingerprint({ HOME: "/nonexistent/fake-home" })}.json`))
+    expect(p.includes(`${path.sep}kkamak${path.sep}`)).toBe(false)
+  })
 
   test("write then read round-trips", () => {
     const env = { HOME: tmpHome(), KKAMAK_TEST: "rt" }
