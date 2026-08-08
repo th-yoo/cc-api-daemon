@@ -16,7 +16,7 @@
 // task's own Step 3 ("adjust the test to the ported modules' real surface").
 
 /** Client side: ensure a daemon is listening, send it a turn, close a
- * session. Real network I/O now (a unix-socket ACP daemon), not the
+ * session. Real network I/O now (a localhost WebSocket ACP daemon), not the
  * former in-process credential-resolve-and-call. */
 export { ensureDaemon, daemonCall, closeSession, type DaemonOutcome } from "./acp-client.ts"
 

@@ -1,9 +1,7 @@
-// Credential resolution for the daemon's Anthropic client — adapted from
-// meta-harness cc-gate-plugin/src/gauge/transport.ts:63-98 (readAuthToken /
-// parseAccessToken / AuthTokenDeps). Not a verbatim port: adds an injectable
-// readFile seam so tests never touch disk; deps default to real host
-// resolution (process.platform, os.homedir, execFileSync, fs.readFileSync)
-// when omitted.
+// Credential resolution for the daemon's Anthropic client. An injectable
+// readFile seam (AuthDeps) means tests never touch disk; deps default to
+// real host resolution (process.platform, os.homedir, execFileSync,
+// fs.readFileSync) when omitted.
 //
 // Precedence (user ruling — API key FIRST):
 //  1. ANTHROPIC_API_KEY (non-empty)   → { apiKey }

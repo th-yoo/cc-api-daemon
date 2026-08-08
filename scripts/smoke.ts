@@ -1,9 +1,9 @@
 // Live smoke — REAL SPEND (one haiku call). Run deliberately, never in CI:
 //   bun scripts/smoke.ts
 // index.ts points at the real ACP client (acp-client.ts): ensureDaemon
-// connects-or-spawns a real daemon over a unix socket; daemonCall is a real
-// round-trip through it. Auth is resolved daemon-side (ApiSession) now, not
-// in this process — one messages.create, and the provenance check.
+// connects-or-spawns a real daemon over a localhost WebSocket; daemonCall is
+// a real round-trip through it. Auth is resolved daemon-side (ApiSession)
+// now, not in this process — one messages.create, and the provenance check.
 //
 // Task 7 reality-check: ensureDaemon(env) alone defaults to waitMs:0 (kick
 // a background spawn, return immediately — the SessionStart-hook mode),

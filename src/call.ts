@@ -3,10 +3,10 @@
 // send-boundary law:
 //   no-call        = provably nothing went toward the model
 //   call-consumed  = any ambiguity at/after `messages.create`
-// Outcome-law + client-construction conventions adapted from meta-harness
-// cc-gate-plugin/src/gauge/transport.ts (sdkCallOutcome, lines ~189-298);
-// machinery that doesn't apply here (structured-output schemas, transport
-// selection, stopReason plumbing) is deliberately not carried over.
+// Stateless: the caller supplies the full `messages` array on every call,
+// no history carried here. Deliberately narrow — no structured-output
+// schemas, no transport selection, no stopReason plumbing, just the one
+// HTTP call and its outcome classification.
 //
 // Task 5 of the api-sdk-swap plan: this file used to also hold an
 // in-process daemonCall/ensureDaemon/closeSession trio — a single-process

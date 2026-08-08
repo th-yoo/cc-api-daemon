@@ -12,11 +12,10 @@
 // its OWN process.env — envFingerprint(process.env) is what `initialize`
 // echoes and discoveryPath(process.env) is where it publishes {port, pid}
 // after binding. Whoever spawns it MUST pass, explicitly, the same env
-// object it fingerprinted. The repo's
-// established detached-spawn idiom (hook-cli.ts:147-154) passes no `env` and
-// inherits, which is correct only when the spawner fingerprinted
-// process.env itself. acp-client.ts's ensureDaemon (a later node) passes it
-// explicitly.
+// object it fingerprinted — a detached spawn that passes no `env` and lets
+// the child inherit is correct only when the spawner ALSO fingerprinted
+// its own inherited process.env. acp-client.ts's ensureDaemon passes it
+// explicitly (spawnDaemonProcess).
 //
 // session/new is cheap (UUID mint + a well-formedness check on the caller's
 // isolation) and its `cwd` is accepted-and-IGNORED (the instrument pins a
@@ -705,7 +704,7 @@ async function runServer(
     return
   }
 
-  // No makeSession override -> the pool's own default (ApiSession, Task 5).
+  // No makeSession override -> the pool's own default (WarmSession, acp-pool.ts).
   const pool = new SessionPool(env, opts?.makeSession ? { makeSession: opts.makeSession } : {})
   const state = createDaemonState()
   const dispatch = createDispatcher(pool, state, fingerprint, env, { makeApiSession: opts?.makeApiSession })
@@ -884,7 +883,7 @@ async function runStdio(
   },
 ): Promise<void> {
   const fingerprint = envFingerprint(env)
-  // No makeSession override -> the pool's own default (ApiSession, Task 5).
+  // No makeSession override -> the pool's own default (WarmSession, acp-pool.ts).
   const pool = new SessionPool(env, opts?.makeSession ? { makeSession: opts.makeSession } : {})
   const state = createDaemonState()
   const dispatch = createDispatcher(pool, state, fingerprint, env, { makeApiSession: opts?.makeApiSession })

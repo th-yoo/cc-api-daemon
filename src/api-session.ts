@@ -1,10 +1,11 @@
 // api-session.ts — the @anthropic-ai/sdk backend for the ACP daemon.
 //
-// Structural twin of meta-harness src/acp/warm-session.ts: same
-// DispatchableSession contract, same §6e outcome law, same FIFO. What it is
-// NOT is warm — there is no subprocess holding state. "Warm" here means the
-// session owns the accumulated conversation array; the HTTP connection is
-// pooled by the SDK and nothing else persists between turns.
+// Same DispatchableSession contract, same §6e outcome law, same FIFO
+// discipline as WarmSession (warm-session.ts), the other backend this
+// daemon can dispatch to. What it is NOT is warm — there is no subprocess
+// holding state. "Warm" here means the session owns the accumulated
+// conversation array; the HTTP connection is pooled by the SDK and nothing
+// else persists between turns.
 import { sendOne } from "./call.ts"
 import type { AuthDeps } from "./auth.ts"
 import { ACP_BUDGET, AUTH_RESOLVE_BUDGET_MS, type WarmIsolation } from "./acp-wire.ts"

@@ -60,11 +60,10 @@ interface InternalEntry extends PoolEntry {
   readonly key: string
 }
 
-/** Cap default 4 — MEASURED, not asserted (2026-08-05 controller ruling;
- * RSS report (meta-harness cc-gate-plugin docs/2026-08-05, session-backend measurement) — marginal ~330 MB/session,
+/** Cap default 4 — MEASURED, not asserted: marginal ~330 MB/session RSS,
  * so 4 sessions ≈ 1.4 GB ≈ 10% of the measurement host's MemAvailable,
  * matching the seat count; 8 is memory-permissible on that host class too,
- * reachable via the env override below rather than a raised default). A
+ * reachable via the env override below rather than a raised default. A
  * different host (see CLAUDE.md's cross-host note) needs its own
  * measurement before trusting this number — the doc's method travels, the
  * number does not. Env-tunable via ACP_MAX_SESSIONS (KKAMAK_ACP_MAX_SESSIONS

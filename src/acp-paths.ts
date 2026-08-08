@@ -1,15 +1,8 @@
 // acp-paths.ts — endpoint + lock + fingerprint seam. Deliberately SEPARATE
 // from acp-daemon.ts: `acp-client.ts` needs these, and a client must never
-// transitively pull in a module that can start a server.
-//
-// The original comment justified the split by claiming `hook-cli.ts` imports
-// `acp-client.ts` on SessionStart. It does not — `hook-cli.ts` contains no
-// ACP reference at all (grep-verified 2026-08-06). The split is still right,
-// but on the general client/server-separation ground above, not that one.
-// Today the only value consumer of the client is
-// `src/gauge/providers/anthropic-cli-warm.ts`, reached through the
-// `src/acp/index.ts` barrel; `src/gauge/send-prompt.ts` type-imports the
-// barrel only, and that `import type` is load-bearing (see its own header).
+// transitively pull in a module that can start a server — a caller on an
+// eager import path must be able to pull in the client without
+// transitively pulling in something that can start a server.
 import crypto from "node:crypto"
 import fs from "node:fs"
 import os from "node:os"
